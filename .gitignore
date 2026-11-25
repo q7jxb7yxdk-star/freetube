@@ -77,3 +77,8 @@ Thumbs.db
 *.mov
 *.wmv
 
+
+# Verified Python distribution files prepared by FreeTube/Scripts/prepare-python.sh
+/FreeTube/Vendor/Python.xcframework/
+/FreeTube/Vendor/Python-iOS.tar.gz
+/FreeTube/Vendor/yt-dlp.zip

@@ -8,13 +8,17 @@
 
 /* Begin PBXBuildFile section */
 		AC591D782FB9E26E009EE538 /* YouTubeKit in Frameworks */ = {isa = PBXBuildFile; productRef = AC591D772FB9E26E009EE538 /* YouTubeKit */; };
-		AC591D892FB9E2BE009EE538 /* YoutubeDL in Frameworks */ = {isa = PBXBuildFile; productRef = AC591D882FB9E2BE009EE538 /* YoutubeDL */; };
+		AC591D892FB9E2BE009EE538 /* FFmpeg-iOS-Lame in Frameworks */ = {isa = PBXBuildFile; productRef = AC591D882FB9E2BE009EE538 /* FFmpeg-iOS-Lame */; };
 		AC591DA82FB9E35C009EE538 /* Kingfisher in Frameworks */ = {isa = PBXBuildFile; productRef = AC591DA72FB9E35C009EE538 /* Kingfisher */; };
 		AC591DAB2FB9E36D009EE538 /* KeychainAccess in Frameworks */ = {isa = PBXBuildFile; productRef = AC591DAA2FB9E36D009EE538 /* KeychainAccess */; };
 		AC591E152FB9F181009EE538 /* LNPopupUI in Frameworks */ = {isa = PBXBuildFile; productRef = AC591E142FB9F181009EE538 /* LNPopupUI */; };
 		AC591E182FB9F2D7009EE538 /* LNPopupUI in Embed Frameworks */ = {isa = PBXBuildFile; productRef = AC591E142FB9F181009EE538 /* LNPopupUI */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		AC591F022FB9F300009EE538 /* FFmpeg-iOS-Support in Frameworks */ = {isa = PBXBuildFile; productRef = AC591F012FB9F300009EE538 /* FFmpeg-iOS-Support */; };
 		AC5924CE2FBB5F2B009EE538 /* SwimplyPlayIndicator in Frameworks */ = {isa = PBXBuildFile; productRef = AC5924CD2FBB5F2B009EE538 /* SwimplyPlayIndicator */; };
+		F3EE91000000000000000001 /* PythonKit in Frameworks */ = {isa = PBXBuildFile; productRef = F3EE91000000000000000008 /* PythonKit */; };
+		F3EE91000000000000000002 /* Python.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F3EE91000000000000000006 /* Python.xcframework */; };
+		F3EE91000000000000000003 /* Python.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = F3EE91000000000000000006 /* Python.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		F3EE91000000000000000004 /* yt-dlp.zip in Resources */ = {isa = PBXBuildFile; fileRef = F3EE91000000000000000007 /* yt-dlp.zip */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -25,6 +29,7 @@
 			dstSubfolderSpec = 10;
 			files = (
 				AC591E182FB9F2D7009EE538 /* LNPopupUI in Embed Frameworks */,
+				F3EE91000000000000000003 /* Python.xcframework in Embed Frameworks */,
 			);
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -33,6 +38,8 @@
 
 /* Begin PBXFileReference section */
 		AC591D232FB9BEE5009EE538 /* FreeTube.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FreeTube.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F3EE91000000000000000006 /* Python.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Python.xcframework; path = Vendor/Python.xcframework; sourceTree = "<group>"; };
+		F3EE91000000000000000007 /* yt-dlp.zip */ = {isa = PBXFileReference; lastKnownFileType = archive.zip; name = "yt-dlp.zip"; path = "Vendor/yt-dlp.zip"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -64,7 +71,9 @@
 				AC591E152FB9F181009EE538 /* LNPopupUI in Frameworks */,
 				AC591DAB2FB9E36D009EE538 /* KeychainAccess in Frameworks */,
 				AC591DA82FB9E35C009EE538 /* Kingfisher in Frameworks */,
-				AC591D892FB9E2BE009EE538 /* YoutubeDL in Frameworks */,
+				AC591D892FB9E2BE009EE538 /* FFmpeg-iOS-Lame in Frameworks */,
+				F3EE91000000000000000001 /* PythonKit in Frameworks */,
+				F3EE91000000000000000002 /* Python.xcframework in Frameworks */,
 				AC591D782FB9E26E009EE538 /* YouTubeKit in Frameworks */,
 				AC591F022FB9F300009EE538 /* FFmpeg-iOS-Support in Frameworks */,
 				AC5924CE2FBB5F2B009EE538 /* SwimplyPlayIndicator in Frameworks */,
@@ -79,6 +88,8 @@
 			children = (
 				AC591D252FB9BEE5009EE538 /* FreeTube */,
 				AC591D242FB9BEE5009EE538 /* Products */,
+				F3EE91000000000000000006 /* Python.xcframework */,
+				F3EE91000000000000000007 /* yt-dlp.zip */,
 			);
 			sourceTree = "<group>";
 		};
@@ -100,6 +111,7 @@
 				AC591D1F2FB9BEE5009EE538 /* Sources */,
 				AC591D202FB9BEE5009EE538 /* Frameworks */,
 				AC591D212FB9BEE5009EE538 /* Resources */,
+				F3EE91000000000000000005 /* Embed Python Modules */,
 				AC591E192FB9F2D7009EE538 /* Embed Frameworks */,
 			);
 			buildRules = (
@@ -112,7 +124,8 @@
 			name = FreeTube;
 			packageProductDependencies = (
 				AC591D772FB9E26E009EE538 /* YouTubeKit */,
-				AC591D882FB9E2BE009EE538 /* YoutubeDL */,
+				AC591D882FB9E2BE009EE538 /* FFmpeg-iOS-Lame */,
+				F3EE91000000000000000008 /* PythonKit */,
 				AC591DA72FB9E35C009EE538 /* Kingfisher */,
 				AC591DAA2FB9E36D009EE538 /* KeychainAccess */,
 				AC591E142FB9F181009EE538 /* LNPopupUI */,
@@ -131,7 +144,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2620;
-				LastUpgradeCheck = 2620;
+				LastUpgradeCheck = 2720;
 				TargetAttributes = {
 					AC591D222FB9BEE5009EE538 = {
 						CreatedOnToolsVersion = 26.2;
@@ -151,7 +164,8 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				AC591D762FB9E26E009EE538 /* XCRemoteSwiftPackageReference "YouTubeKit" */,
-				AC591D872FB9E2BE009EE538 /* XCRemoteSwiftPackageReference "YoutubeDL-iOS" */,
+				AC591D872FB9E2BE009EE538 /* XCLocalSwiftPackageReference "FFmpeg-iOS-Lame" */,
+				F3EE91000000000000000009 /* XCLocalSwiftPackageReference "Vendor/PythonKit" */,
 				AC591DA62FB9E35C009EE538 /* XCRemoteSwiftPackageReference "Kingfisher" */,
 				AC591DA92FB9E36D009EE538 /* XCRemoteSwiftPackageReference "keychainaccess" */,
 				AC591E132FB9F181009EE538 /* XCRemoteSwiftPackageReference "LNPopupUI" */,
@@ -173,10 +187,36 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F3EE91000000000000000004 /* yt-dlp.zip in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		F3EE91000000000000000005 /* Embed Python Modules */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(PROJECT_DIR)/Scripts/embed-python.sh",
+				"$(PROJECT_DIR)/Vendor/Python-iOS.tar.gz",
+			);
+			name = "Embed Python Modules";
+			outputFileListPaths = (
+				"$(PROJECT_DIR)/Scripts/PythonModules.xcfilelist",
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/python",
+				"$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Frameworks",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "/bin/bash \"$PROJECT_DIR/Scripts/embed-python.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		AC591D1F2FB9BEE5009EE538 /* Sources */ = {
@@ -194,6 +234,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -248,6 +289,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -258,6 +300,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -305,6 +348,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -319,9 +363,17 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 22;
-				DEVELOPMENT_TEAM = 2Z797QJNH7;
+				DEVELOPMENT_TEAM = WX793X49GJ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				"HEADER_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/Python.xcframework/ios-arm64/include/python3.15",
+				);
+				"HEADER_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/Python.xcframework/ios-arm64_x86_64-simulator/include/python3.15",
+				);
 				INFOPLIST_FILE = FreeTube/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = FreeTube;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -339,7 +391,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.leshko.freetube;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sunny.freetube;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -347,6 +399,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = FreeTube/Core/Python/EmbeddedCPython.h;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -362,10 +415,18 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 22;
-				DEVELOPMENT_TEAM = 2Z797QJNH7;
+				DEVELOPMENT_TEAM = WX793X49GJ;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_TESTABILITY = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				"HEADER_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/Python.xcframework/ios-arm64/include/python3.15",
+				);
+				"HEADER_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/Python.xcframework/ios-arm64_x86_64-simulator/include/python3.15",
+				);
 				INFOPLIST_FILE = FreeTube/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = FreeTube;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -383,15 +444,15 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.leshko.freetube;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sunny.freetube;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				STRIP_STYLE = debugging;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = NO;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = FreeTube/Core/Python/EmbeddedCPython.h;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
@@ -422,6 +483,17 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		F3EE91000000000000000009 /* XCLocalSwiftPackageReference "Vendor/PythonKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/PythonKit;
+		};
+		AC591D872FB9E2BE009EE538 /* XCLocalSwiftPackageReference "FFmpeg-iOS-Lame" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/FFmpeg-iOS-Lame;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		AC591D762FB9E26E009EE538 /* XCRemoteSwiftPackageReference "YouTubeKit" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -431,20 +503,12 @@
 				kind = branch;
 			};
 		};
-		AC591D872FB9E2BE009EE538 /* XCRemoteSwiftPackageReference "YoutubeDL-iOS" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/kewlbear/YoutubeDL-iOS.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.0.9;
-			};
-		};
 		AC591DA62FB9E35C009EE538 /* XCRemoteSwiftPackageReference "Kingfisher" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/onevcat/Kingfisher.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 8.9.0;
+				minimumVersion = 8.16.0;
 			};
 		};
 		AC591DA92FB9E36D009EE538 /* XCRemoteSwiftPackageReference "keychainaccess" */ = {
@@ -460,7 +524,7 @@
 			repositoryURL = "https://github.com/LeoNatan/LNPopupUI.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 3.0.2;
+				minimumVersion = 4.0.4;
 			};
 		};
 		AC591F002FB9F300009EE538 /* XCRemoteSwiftPackageReference "FFmpeg-iOS-Support" */ = {
@@ -487,10 +551,10 @@
 			package = AC591D762FB9E26E009EE538 /* XCRemoteSwiftPackageReference "YouTubeKit" */;
 			productName = YouTubeKit;
 		};
-		AC591D882FB9E2BE009EE538 /* YoutubeDL */ = {
+		AC591D882FB9E2BE009EE538 /* FFmpeg-iOS-Lame */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = AC591D872FB9E2BE009EE538 /* XCRemoteSwiftPackageReference "YoutubeDL-iOS" */;
-			productName = YoutubeDL;
+			package = AC591D872FB9E2BE009EE538 /* XCLocalSwiftPackageReference "FFmpeg-iOS-Lame" */;
+			productName = "FFmpeg-iOS-Lame";
 		};
 		AC591DA72FB9E35C009EE538 /* Kingfisher */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -516,6 +580,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AC5924CC2FBB5F2B009EE538 /* XCRemoteSwiftPackageReference "SwimplyPlayIndicator" */;
 			productName = SwimplyPlayIndicator;
+		};
+		F3EE91000000000000000008 /* PythonKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F3EE91000000000000000009 /* XCLocalSwiftPackageReference "Vendor/PythonKit" */;
+			productName = PythonKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

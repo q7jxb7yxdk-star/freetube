@@ -5,10 +5,10 @@ import PythonKit
 /// Probes an arbitrary URL via yt-dlp and returns a `RemoteMedia` describing what's
 /// downloadable. Backed by `freetube_yt_dlp_extract_info` (which calls Python's
 /// `ydl.extract_info(url, download=False)`), routed through `PythonRunner.runIsolated` so
-/// the Python interpreter is only ever touched from its pinned thread (CLAUDE.md §15.1).
+/// the Python interpreter is only ever touched while the worker holds the interpreter lock.
 ///
 /// **Important:** every `PythonObject` we touch is extracted to Swift-native primitives
-/// *inside* the `runIsolated` closure — that closure runs on the Python thread, which is
+/// *inside* the `runIsolated` closure — that closure holds the interpreter lock, which is
 /// where PythonKit's reference counting is safe. Returning a `PythonObject` or capturing
 /// one in a `Task { @MainActor in ... }` block would release it on the wrong thread and
 /// crash inside `_PyInterpreterState_GET`. See `DownloadManager.runYoutubeDLDownload`'s
@@ -24,7 +24,7 @@ final class YtDlpInfoService: Sendable {
             log.info("[probe] calling PythonRunner.runIsolated…")
             let media = try await PythonRunner.shared.runIsolated { [log] () -> RemoteMedia in
                 log.info("[probe] inside runIsolated; calling freetube_yt_dlp_extract_info")
-                let info = try await freetube_yt_dlp_extract_info(url: url)
+                let info = try freetube_yt_dlp_extract_info(url: url)
                 log.info("[probe] freetube_yt_dlp_extract_info returned; converting to RemoteMedia")
                 // For playlists yt-dlp returns `_type=playlist` with an `entries` array.
                 // v1 treats playlists as "pick the first entry" because the UI doesn't render
@@ -65,7 +65,7 @@ final class YtDlpInfoService: Sendable {
     /// fatal-errors on missing keys, and yt-dlp's response shape varies wildly by extractor
     /// (a SoundCloud track has no `channel`; a generic image has no `formats`). A single
     /// missing key would crash the whole probe.
-    private static func convert(info: PythonObject, originalURL: String) -> RemoteMedia {
+    private nonisolated static func convert(info: PythonObject, originalURL: String) -> RemoteMedia {
         let id = info.checking["id"].flatMap(String.init) ?? UUID().uuidString
         let title = info.checking["title"].flatMap(String.init) ?? "(no title)"
         let uploader: String = {
@@ -125,7 +125,7 @@ final class YtDlpInfoService: Sendable {
         )
     }
 
-    private static func parseFormat(_ fmt: PythonObject) -> RemoteFormat? {
+    private nonisolated static func parseFormat(_ fmt: PythonObject) -> RemoteFormat? {
         let id = fmt.checking["format_id"].flatMap(String.init) ?? ""
         guard !id.isEmpty else { return nil }
 

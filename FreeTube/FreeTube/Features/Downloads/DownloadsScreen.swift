@@ -60,7 +60,7 @@ struct DownloadsScreen: View {
     /// "tracked" rows (file has our metadata xattr) and "orphan" rows (file present but no
     /// xattr — surfaces with filename-as-title). We just map and apply the user's sort.
     private var savedItems: [SavedItem] {
-        sortItems(store.entries.map(SavedItem.init(from:)))
+        sortItems(store.entries.map { SavedItem(from: $0) })
     }
 
     /// Aggregate stats shown under the title.

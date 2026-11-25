@@ -14,10 +14,10 @@ final class AccountViewModel {
 
     init(
         service: any AccountServicing = AccountService(),
-        session: SessionManager = .shared
+        session: SessionManager? = nil
     ) {
         self.service = service
-        self.session = session
+        self.session = session ?? .shared
     }
 
     func load() async {

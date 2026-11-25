@@ -34,7 +34,7 @@ struct RemoteMedia: Identifiable, Sendable, Hashable {
 
 /// One downloadable variant. Captures the fields the UI renders + the fields the downloader
 /// needs to dispatch (URL, protocol, manifest-ness).
-struct RemoteFormat: Identifiable, Sendable, Hashable {
+nonisolated struct RemoteFormat: Identifiable, Sendable, Hashable {
     /// yt-dlp's stable `format_id` (e.g. "137", "299+140", "hls-720p"). Used as `Identifiable.id`
     /// and as the `-f` argument when re-handed to yt-dlp would be required (we don't actually
     /// re-invoke yt-dlp — we use `url` directly — but keeping the id around is useful for logs).

@@ -106,7 +106,7 @@ If you do not agree with these terms, do not install or use this software.
 
 ## Requirements
 
-- Xcode 15 or later
+- Xcode 27 or later
 - iOS 17.0 or later (real device recommended — Python / yt-dlp work, but Simulator can be flaky for ffmpeg-heavy paths)
 - A Google account (or family-managed account); login is performed inside the app via a WebView
 
@@ -116,8 +116,12 @@ If you do not agree with these terms, do not install or use this software.
 
 ```bash
 git clone <this repo>
+cd freetube
+bash FreeTube/Scripts/prepare-python.sh
 open FreeTube/FreeTube.xcodeproj
 ```
+
+The preparation script downloads and verifies the embedded Python and yt-dlp assets.
 
 Open in Xcode, set your signing team on the FreeTube target, then ⌘R.
 
@@ -155,7 +159,7 @@ See `CLAUDE.md` § 6 for the exact mapping from YouTubeKit response types to ser
 |---|---|
 | UI | SwiftUI (`@Observable`, iOS 17+) |
 | YouTube API | [`b5i/YouTubeKit`](https://github.com/b5i/YouTubeKit) — cookie-based, no API key |
-| Stream extraction | [`kewlbear/YoutubeDL-iOS`](https://github.com/kewlbear/YoutubeDL-iOS) (yt-dlp via PythonKit) |
+| Stream extraction | [CPython for iOS](https://www.python.org/downloads/ios/) and [yt-dlp](https://github.com/yt-dlp/yt-dlp) via PythonKit |
 | In-process ffmpeg | `FFmpegSupport` |
 | Playback | `AVFoundation` / `AVKit` (`AVQueuePlayer`, `AVPlayerViewController`, `AVPictureInPictureController`) |
 | Mini / expanded player | `LNPopupUI` |
@@ -208,17 +212,17 @@ For most videos, tier 1 wins and you get an offline file. For YouTube's PoT-lock
 
 These are the non-obvious bits. If you're refactoring `Core/`, read them first.
 
-### Python on iOS doesn't tolerate cross-thread access
+### Embedded Python execution
 
-`PythonKit` + CPython require single-thread interpreter access. A plain Swift `actor` rotates between cooperative-pool workers and Python crashes. `PythonRunner` uses a **custom `SerialExecutor`** backed by a `DispatchQueue(.utility)` so GCD reuses the same worker thread, plus strict Task chaining via a `pump()` drain so even `await`-induced reentry can't double-enter yt-dlp.
+`PythonRunner` queues work by priority and executes each Python operation synchronously on a serial utility queue. Each operation holds CPython's GIL on its worker thread. Convert Python objects to Swift values before returning from the operation.
 
 ### ffmpeg's C library is not thread-safe
 
 The `+faststart` post-pass crashes on concurrent calls (`EXC_BAD_ACCESS` in `ff_format_shift_data`). `Hook.m`'s `setjmp`/`longjmp` is also unsafe across concurrent invocations. `FFmpegRunner` is a serial actor that all ffmpeg calls go through.
 
-### yt-dlp's ffmpeg merger hangs on iOS
+### FFmpeg runs in-process on iOS
 
-When yt-dlp's Python side calls `subprocess.Popen.communicate` against ffmpeg, the call never returns — `longjmp` tears through the Python interpreter stack. We pass `--ffmpeg-location /dev/null/no-ffmpeg` so yt-dlp fails fast at probe time instead of hanging, then mux ourselves with direct `FFmpegSupport.ffmpeg(...)` calls.
+The embedded interpreter cannot launch FFmpeg as a subprocess. FreeTube disables yt-dlp's FFmpeg probe and merges separate audio and video files through `FFmpegSupport.ffmpeg(...)`.
 
 ### YouTube's PoT and n-cipher
 

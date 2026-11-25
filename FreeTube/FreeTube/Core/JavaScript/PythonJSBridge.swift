@@ -1,64 +1,34 @@
 import Foundation
 import OSLog
 import PythonKit
-import PythonSupport
 
-/// Glue that wires `JavaScriptCore` into the embedded yt-dlp Python runtime so YouTube's
-/// N/SIG challenges (the obfuscated functions in player.js that protect stream URLs) get
-/// solved transparently — same as a desktop install with `deno` available, just running
-/// on JavaScriptCore instead of V8.
-///
-/// **Four pieces, all installed by `install()`:**
-/// 1. `builtins.eval_js(code) -> str` — Python-callable hook that runs JS via
-///    `JSEvaluator`, wrapping the source so `console.log` output is captured and returned.
-/// 2. **`yt_dlp_ejs` package shim** — three synthetic modules in `sys.modules`
-///    (`yt_dlp_ejs`, `yt_dlp_ejs.yt`, `yt_dlp_ejs.yt.solver`) that expose `version`,
-///    `core()`, `lib()` reading from the bundled `core.min.js` / `lib.min.js`. yt-dlp's
-///    `_pypackage_source` finds this via `from yt_dlp.dependencies import yt_dlp_ejs` and
-///    uses the JS content as its challenge-solver script source.
-/// 3. **`DenoJsRuntime._info` stub** — replaces the real binary-probe with a function that
-///    returns `JsRuntimeInfo(name='deno', path=..., version='2.0.0', version_tuple=(2,0,0),
-///    supported=True)`. Without this, yt-dlp's `_js_runtimes['deno'].info` would be `None`
-///    (no deno binary on iOS) and the whole EJS path gets skipped.
-/// 4. **`subprocess.Popen` extension** — the YoutubeDL-iOS package already replaced
-///    `subprocess.Popen` with its ffmpeg-only `Pop` class. We monkey-patch `Pop.__init__`
-///    and `Pop.communicate` to also recognize argv starting with our fake deno path
-///    (`/dev/null/freetube-deno`), route stdin through `eval_js`, and return the JS result
-///    on stdout. `yt_dlp.utils.Popen` inherits from `Pop`, so this propagates to yt-dlp's
-///    EJS provider without it knowing anything has changed.
-///
-/// **Ordering matters.** `install()` must be called **after** `YtDlp()`'s init has run
-/// (which triggers `injectFakePopen` in YoutubeDL-iOS) and **before** `ydl.download`
-/// (which triggers JSC provider registration and the first call to `_js_runtimes`). The
-/// `freetube_yt_dlp` function in `FreeTubeYtDlp.swift` enforces this ordering.
-///
-/// **What we don't do:** we don't intercept ffmpeg/ffprobe — those still flow through the
-/// YoutubeDL-iOS `popenHandler` path (now reached via fall-through from our patched
-/// `Pop.__init__`). And we don't intercept `node`/`bun`/`quickjs` — yt-dlp's preference
-/// ranks `deno` highest at 1000 and uses it if available, so wiring just deno is enough.
+/// Runs the bundled yt-dlp solver scripts in JavaScriptCore.
 @available(iOS 17.0, *)
 nonisolated enum PythonJSBridge {
     private static let log = AppLog(subsystem: "com.leshko.freetube", category: "JSBridge")
 
-    /// The fake path we pass as `js_runtimes={'deno': {'path': ...}}` and recognize in our
-    /// patched `Pop.__init__`. Doesn't have to be a real path — yt-dlp only uses it as the
-    /// argv[0] of `Popen` calls, which our shim intercepts before any filesystem access.
+    /// Identifies the in-process JavaScript adapter to the yt-dlp Deno provider.
     static let fakeDenoPath = "/dev/null/freetube-deno"
 
-    /// Strong reference to the `eval_js` callable. PythonKit's `PythonFunction` wraps a
-    /// heap-allocated bridge; we keep a Swift-side strong ref so the bridge isn't torn
-    /// down while Python still holds the function as `builtins.eval_js`.
-    private static var retainedEvalJS: PythonFunction?
+    /// Install the shim before importing yt-dlp, which subclasses subprocess.Popen at import.
+    static func install() throws {
+        let builtins = try Python.attemptImport("builtins")
+        guard builtins.checking.__ft_js_bridge_installed__ == nil else { return }
 
-    /// Installs all four pieces. Safe to call multiple times — each piece guards against
-    /// double-install (re-binding `builtins.eval_js`, idempotent `sys.modules` writes,
-    /// idempotent monkey-patches via a sentinel attribute).
-    static func install() {
-        installEvalJSBuiltin()
-        installEJSPackageShim()
-        installRuntimeStub()
-        installPopenExtension()
-        log.info("PythonJSBridge installed (eval_js + yt_dlp_ejs shim + deno stub + Popen ext)")
+        installEvalJSBuiltin(builtins: builtins)
+        try installEJSPackageShim(builtins: builtins)
+        try runPython(
+            popenAdapterPython.replacingOccurrences(of: "__FAKE_DENO_PATH__", with: "'\(fakeDenoPath)'"),
+            builtins: builtins
+        )
+        try runPython(runtimeStubPython, builtins: builtins)
+        builtins.__ft_js_bridge_installed__ = true
+        log.info("JavaScriptCore adapter installed")
+    }
+
+    private static func runPython(_ script: String, builtins: PythonObject) throws {
+        let namespace = builtins.dict()
+        try builtins.exec.throwing.dynamicallyCall(withArguments: script, namespace)
     }
 
     // MARK: - 1. eval_js builtin
@@ -70,9 +40,9 @@ nonisolated enum PythonJSBridge {
     /// (which writes its JSON result via `console.log(JSON.stringify(...))`) work without
     /// modification. `JSContext` doesn't ship a `console` global, so the prologue defines
     /// one inside the evaluation scope.
-    private static func installEvalJSBuiltin() {
-        let evalJS = PythonFunction { (args: PythonObject) -> PythonConvertible in
-            guard let code = String(args[0]) else {
+    private static func installEvalJSBuiltin(builtins: PythonObject) {
+        let evalJS = PythonFunction { (argument: PythonObject) -> PythonConvertible in
+            guard let code = String(argument) else {
                 let builtins = Python.import("builtins")
                 let err = builtins.TypeError("eval_js: first argument must be a string")
                 throw PythonError.exception(err, traceback: nil)
@@ -88,9 +58,6 @@ nonisolated enum PythonJSBridge {
                 throw PythonError.exception(err, traceback: nil)
             }
         }
-        retainedEvalJS = evalJS
-
-        let builtins = Python.import("builtins")
         builtins.eval_js = evalJS.pythonObject
     }
 
@@ -122,42 +89,13 @@ nonisolated enum PythonJSBridge {
 
     // MARK: - 2. yt_dlp_ejs package shim
 
-    /// Installs the three synthetic modules. Reads bundled JS once and binds it into the
-    /// modules' `core()` / `lib()` closures. Errors loading from the bundle abort the
-    /// install (with a log) — `_has_ejs` will then be falsy and yt-dlp will fall through
-    /// to the (non-pypackage) sources, which we don't ship either, so the EJS path will be
-    /// effectively disabled. That's the correct fail-safe behavior.
-    private static func installEJSPackageShim() {
-        let coreJS: String
-        let libJS: String
-        do {
-            coreJS = try EJSResources.core()
-            libJS = try EJSResources.lib()
-        } catch {
-            log.error("EJS resources not found — skipping yt_dlp_ejs shim: \(String(describing: error), privacy: .public)")
-            return
-        }
-
-        // Park the JS bodies on `builtins` so the Python setup code can read them without
-        // string-escaping issues across the Swift → runSimpleString boundary.
-        let builtins = Python.import("builtins")
-        builtins.__ft_ejs_core_js__ = PythonObject(coreJS)
-        builtins.__ft_ejs_lib_js__ = PythonObject(libJS)
+    private static func installEJSPackageShim(builtins: PythonObject) throws {
+        builtins.__ft_ejs_core_js__ = PythonObject(try EJSResources.core())
+        builtins.__ft_ejs_lib_js__ = PythonObject(try EJSResources.lib())
         builtins.__ft_ejs_version__ = PythonObject(EJSResources.version)
-
-        runSimpleString(ejsPackageShimPython)
-        log.info("yt_dlp_ejs shim installed (core=\(coreJS.count) bytes, lib=\(libJS.count) bytes, version=\(EJSResources.version, privacy: .public))")
+        try runPython(ejsPackageShimPython, builtins: builtins)
     }
 
-    /// Python that builds `yt_dlp_ejs`, `yt_dlp_ejs.yt`, and `yt_dlp_ejs.yt.solver` as
-    /// `types.ModuleType` instances and registers them in `sys.modules`. Each module is
-    /// also attached as an attribute of its parent so `yt_dlp_ejs.yt.solver` works as
-    /// attribute access (which is what `from yt_dlp.dependencies import yt_dlp_ejs as
-    /// _has_ejs` + later `yt_dlp_ejs.yt.solver.core()` relies on).
-    ///
-    /// The `core()` / `lib()` closures pull from the `__ft_ejs_*_js__` builtins set
-    /// before this script runs; that lets us avoid embedding ~158 KB of JS inside a
-    /// Python triple-quoted string.
     private static let ejsPackageShimPython = """
     import sys
     import types
@@ -205,158 +143,69 @@ nonisolated enum PythonJSBridge {
 
     // MARK: - 3. DenoJsRuntime info stub
 
-    /// Replaces `yt_dlp.utils._jsruntime.DenoJsRuntime._info` with a function that returns
-    /// a synthetic supported `JsRuntimeInfo`. Without this, yt-dlp's `_js_runtimes['deno']
-    /// .info` would call the real `_info`, which spawns `deno --version` via
-    /// `Popen.run(...)`. Our `Pop` patch handles that path too, but the cleaner contract
-    /// is to short-circuit the probe — yt-dlp's other call sites for `runtime_info` (e.g.
-    /// `is_available`) check the cached property, so a stub here covers them all.
-    private static func installRuntimeStub() {
-        runSimpleString(runtimeStubPython)
-        log.info("DenoJsRuntime._info stub installed")
-    }
-
     private static let runtimeStubPython = """
-    try:
-        from yt_dlp.utils._jsruntime import DenoJsRuntime, JsRuntimeInfo
-        from yt_dlp.utils._jsruntime import _determine_runtime_path
+    from yt_dlp.utils._jsruntime import DenoJsRuntime, JsRuntimeInfo
 
-        def _freetube_deno_info(self):
-            path = _determine_runtime_path(self._path, 'deno')
-            return JsRuntimeInfo(
-                name='deno', path=path,
-                version='2.0.0', version_tuple=(2, 0, 0),
-                supported=True,
-            )
+    def _freetube_deno_info(self):
+        version = DenoJsRuntime.MIN_SUPPORTED_VERSION
+        return JsRuntimeInfo(
+            name='deno', path=self._path,
+            version='.'.join(map(str, version)), version_tuple=version,
+            supported=True,
+        )
 
-        # Idempotency: only patch once.
-        if not getattr(DenoJsRuntime, '_freetube_patched', False):
-            DenoJsRuntime._info = _freetube_deno_info
-            DenoJsRuntime._freetube_patched = True
-    except Exception as _e:
-        import sys
-        print('PythonJSBridge: DenoJsRuntime patch failed:', _e, file=sys.stderr)
+    DenoJsRuntime._info = _freetube_deno_info
     """
 
-    // MARK: - 4. Pop extension (subprocess.Popen monkey-patch)
-
-    /// Extends the YoutubeDL-iOS `Pop` class (already installed as `subprocess.Popen` by
-    /// `injectFakePopen`) to also handle the fake-deno argv path. `yt_dlp.utils.Popen` is
-    /// a subclass of `Pop`, so `super().__init__` from yt-dlp's wrapper reaches our
-    /// patched `__init__` and `super().communicate` reaches our patched `communicate`.
-    ///
-    /// **Why monkey-patch the class instead of replacing `subprocess.Popen`:** by the
-    /// time we're called, `yt_dlp.utils` has already imported and frozen its `class
-    /// Popen(subprocess.Popen):` with the *original* (pre-patch) `Pop` as its base.
-    /// Rebinding `subprocess.Popen` to a new class wouldn't affect that MRO. Modifying
-    /// the existing `Pop`'s methods does — Python looks up methods dynamically.
-    private static func installPopenExtension() {
-        let fakePathPyLiteral = "'\(fakeDenoPath)'"
-        let py = popenExtensionPython.replacingOccurrences(of: "__FAKE_DENO_PATH__", with: fakePathPyLiteral)
-        runSimpleString(py)
-        log.info("Pop class extended with deno handler (path=\(fakeDenoPath, privacy: .public))")
-    }
-
-    private static let popenExtensionPython = """
-    import subprocess
+    private static let popenAdapterPython = """
     import builtins
+    import subprocess
 
-    _Pop = subprocess.Popen
     _FAKE_DENO_PATH = __FAKE_DENO_PATH__
+    _OriginalPopen = subprocess.Popen
 
-    if not getattr(_Pop, '_freetube_patched', False):
-        _orig_init = _Pop.__init__
-        _orig_communicate = _Pop.communicate
+    class _FreeTubePopen(_OriginalPopen):
+        _freetube_adapter = True
 
-        def _is_deno_argv(args):
-            try:
-                cmd = args[0]
-            except Exception:
-                return False
-            if not isinstance(cmd, (list, tuple)) or len(cmd) == 0:
-                return False
-            return cmd[0] == _FAKE_DENO_PATH
-
-        def _patched_init(self, *args, **kwargs):
-            self._ft_deno = False
-            if _is_deno_argv(args):
-                self._ft_deno = True
-                self._ft_cmd = args[0]
-                self.returncode = None
-                # yt_dlp.utils.Popen.__init__ sets self.__text_mode via name-mangling
-                # (Popen__text_mode). We honor that via the text-mode kwargs the caller
-                # passed: yt-dlp's deno provider passes text=True, so stdout/stderr we
-                # return must be `str`. Track it so communicate returns the right type.
-                self._ft_text_mode = bool(
-                    kwargs.get('text')
-                    or kwargs.get('universal_newlines')
-                    or kwargs.get('encoding')
-                    or kwargs.get('errors')
-                )
-                # Some yt-dlp code paths read .stdin/.stdout/.stderr on the proc object;
-                # set placeholders so attribute access doesn't AttributeError.
-                self.stdin = None
-                self.stdout = None
-                self.stderr = None
+        def __init__(self, args, *other, **kwargs):
+            self._ft_deno = isinstance(args, (list, tuple)) and bool(args) and args[0] == _FAKE_DENO_PATH
+            if not self._ft_deno:
+                super().__init__(args, *other, **kwargs)
                 return
-            _orig_init(self, *args, **kwargs)
+            self.args = args
+            self.returncode = None
+            self.stdin = self.stdout = self.stderr = None
+            self._ft_text_mode = any(kwargs.get(key) for key in ('text', 'universal_newlines', 'encoding', 'errors'))
 
-        def _patched_communicate(self, *args, **kwargs):
-            if not getattr(self, '_ft_deno', False):
-                return _orig_communicate(self, *args, **kwargs)
-
-            # communicate(input=None, timeout=None) — yt-dlp passes the JS source
-            # positionally as `input`.
-            if args:
-                stdin = args[0]
-            else:
-                stdin = kwargs.get('input', None)
-
-            if stdin is None:
-                stdin_str = ''
-            elif isinstance(stdin, (bytes, bytearray)):
-                stdin_str = stdin.decode('utf-8', errors='replace')
-            else:
-                stdin_str = str(stdin)
-
-            text_mode = getattr(self, '_ft_text_mode', True)
+        def communicate(self, input=None, timeout=None):
+            if not self._ft_deno:
+                return super().communicate(input, timeout)
+            if isinstance(input, (bytes, bytearray)):
+                input = input.decode('utf-8', errors='replace')
             try:
-                result = builtins.eval_js(stdin_str)
+                output = builtins.eval_js(input or '')
+                error = ''
                 self.returncode = 0
-                if text_mode:
-                    return (str(result), '')
-                else:
-                    return (str(result).encode('utf-8'), b'')
-            except Exception as e:
+            except Exception as exc:
+                output = ''
+                error = f'FreeTube JavaScriptCore adapter: {exc}'
                 self.returncode = 1
-                err_msg = f'freetube-jscore-shim: {e}'
-                if text_mode:
-                    return ('', err_msg)
-                else:
-                    return ('', err_msg.encode('utf-8'))
+            return (output, error) if self._ft_text_mode else (output.encode(), error.encode())
 
-        def _patched_kill(self, *args, **kwargs):
-            if getattr(self, '_ft_deno', False):
-                return
-            # Original Pop.kill takes no args; yt_dlp.utils.Popen.kill calls super().kill()
-            # with no args. Pass through cleanly.
-            try:
-                return _orig_kill(self)
-            except TypeError:
-                return _orig_kill(self, *args, **kwargs)
+        def kill(self):
+            if not self._ft_deno:
+                super().kill()
 
-        def _patched_wait(self, *args, **kwargs):
-            if getattr(self, '_ft_deno', False):
-                return self.returncode if self.returncode is not None else 0
-            return _orig_wait(self, *args, **kwargs)
+        def wait(self, timeout=None):
+            if not self._ft_deno:
+                return super().wait(timeout)
+            return self.returncode if self.returncode is not None else 0
 
-        _orig_kill = _Pop.kill
-        _orig_wait = _Pop.wait
+        def __exit__(self, *exc):
+            if not self._ft_deno:
+                return super().__exit__(*exc)
 
-        _Pop.__init__ = _patched_init
-        _Pop.communicate = _patched_communicate
-        _Pop.kill = _patched_kill
-        _Pop.wait = _patched_wait
-        _Pop._freetube_patched = True
+    if not getattr(_OriginalPopen, '_freetube_adapter', False):
+        subprocess.Popen = _FreeTubePopen
     """
 }

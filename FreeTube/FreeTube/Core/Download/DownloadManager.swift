@@ -7,209 +7,89 @@ import OSLog
 import PythonKit
 import SwiftData
 import UIKit
-import YoutubeDL
 
-/// Runs every Python / yt-dlp call on a single dedicated background thread, off the main actor.
-///
-/// **The two failure modes this solves:**
-/// 1. **Wrong-thread crash.** PythonKit + CPython assume only one thread touches the interpreter
-///    — specifically, the same thread that ran `PythonSupport.initialize()`. A plain `actor` runs
-///    its methods on its own cooperative-queue executor, where workers rotate between threads —
-///    Python's `_PyInterpreterState_GET` crashes the moment it sees an unrecognized worker. We fix
-///    this with a **custom `SerialExecutor`** backed by a serial `DispatchQueue`: GCD reuses the
-///    same worker thread back-to-back for serial-queue jobs, so Python sees a stable thread.
-/// 2. **Reentrancy interleaving.** Actor methods only guarantee one *body* runs at a time — but
-///    when that body suspends at an `await`, the executor is free to pick up the next caller. So
-///    even a serial actor can have two `yt_dlp` calls suspended on it simultaneously, tramping
-///    each other's interpreter state. We fix this with **strict Task-chaining** through `pending`:
-///    new callers don't just `await` to enter the actor, they explicitly wait for the previous
-///    Task to fully finish before starting their own yt-dlp.
+/// Queues yt-dlp work by priority and executes it on a serial utility queue.
 @available(iOS 17.0, *)
 actor PythonRunner {
     static let shared = PythonRunner()
 
-    /// `nonisolated` so we can log from anywhere — including the detached pump task
-    /// without an actor hop. Used by every choke point on the Link-probe / YouTube-download
-    /// path so a TestFlight log can pinpoint exactly which step stalled.
-    @ObservationIgnored private nonisolated let log = AppLog(subsystem: "com.leshko.freetube", category: "PythonRunner")
-
-    /// Priority levels for incoming yt-dlp work. `.high` is reserved for downloads the user is
-    /// actively waiting on (e.g. tapping a video in search results — they want playback now).
-    /// `.low` is the default for background work (playlist Download All, queue prefetch).
-    /// Within the same priority, items are processed FIFO. A high-priority arrival jumps ahead
-    /// of every pending low-priority item but **cannot** preempt the currently-running yt-dlp:
-    /// Python's interpreter has no safe interrupt point.
     enum Priority {
         case high
         case low
     }
 
-    /// Pins this actor to a dedicated background-thread executor (NOT the main actor's executor and
-    /// NOT the cooperative pool). GCD's serial queue gives us thread stability "in practice" —
-    /// back-to-back jobs on the same serial queue use the same worker thread, which is what
-    /// PythonKit needs.
-    private nonisolated let executor = PythonSerialExecutor()
-    nonisolated var unownedExecutor: UnownedSerialExecutor { executor.asUnownedSerialExecutor() }
-
-    /// A unit of work runnable on the Python-isolated execution context. Each job handles
-    /// its own completion (resuming whatever continuation the public-API call created), so
-    /// `pump()` just runs them sequentially without having to know what kind they are.
-    /// This unification lets us serialize yt-dlp downloads AND one-off Python operations
-    /// (e.g. `YtDlpUpdater`'s version read) through the same FIFO — without it, two paths
-    /// calling `Python.attemptImport` from different cooperative-pool workers would race
-    /// CPython's interpreter state and crash with `_PyTuple_FromArray` / `init_fs_encoding`.
-    private typealias Job = @Sendable () async -> Void
-
+    private typealias Job = @Sendable () -> Void
+    private let worker = DispatchQueue(label: "com.leshko.freetube.python", qos: .utility)
     private var highPriority: [Job] = []
     private var lowPriority: [Job] = []
-    /// True while a yt-dlp invocation is in flight. The pump loop sets this on entry and clears
-    /// on exit; any reentrant `run(…)` calls that arrive during the `await` see this flag, just
-    /// enqueue their ticket, and exit without spawning a parallel pump.
     private var isRunning = false
 
     private init() {}
 
-    /// Submit a yt-dlp run. The call suspends until this ticket reaches the front of its
-    /// priority lane AND any in-flight yt-dlp finishes — guaranteeing strict serialization
-    /// (Python interpreter can only host one yt-dlp at a time) while letting `.high` callers
-    /// jump ahead of any pending `.low` backlog.
-    ///
-    /// Default priority is `.low`. Pass `.high` from playback paths where the user is actively
-    /// waiting for the video to start (search/home tap, play-next, mini-player resume).
-    func run(argv: [String],
-             progress: @escaping @Sendable ([String: PythonObject]) -> Void,
-             log ytLog: @escaping @Sendable (String, String) -> Void,
-             priority: Priority = .low) async throws {
-        log.info("[PythonRunner.run] enqueue priority=\(String(describing: priority), privacy: .public) argv0=\(argv.first ?? "?", privacy: .public)")
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let log = self.log
+    func run(
+        argv: [String],
+        progress: @escaping @Sendable ([String: PythonObject]) -> Void,
+        log: @escaping @Sendable (String, String) -> Void,
+        priority: Priority = .low
+    ) async throws {
+        try await submit(priority: priority) {
+            try freetube_yt_dlp(argv: argv, progress: progress, log: log)
+        }
+    }
+
+    /// Run a synchronous Python operation. Only Swift values may leave the interpreter.
+    func runIsolated<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await submit(priority: .high, work)
+    }
+
+    private func submit<T: Sendable>(
+        priority: Priority,
+        _ work: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
             let job: Job = {
-                log.info("[PythonRunner.run] job starting freetube_yt_dlp")
                 do {
-                    try await freetube_yt_dlp(argv: argv, progress: progress, log: ytLog)
-                    log.info("[PythonRunner.run] job completed")
-                    continuation.resume()
+                    let moduleURL = try YtDlpModule.activeArchive()
+                    let result = try EmbeddedPython.withInterpreter(moduleURL: moduleURL) {
+                        do {
+                            return try work()
+                        } catch {
+                            // PythonKit errors may own Python objects. Format and release
+                            // them before the interpreter lock is released.
+                            throw PythonJobError(message: String(describing: error))
+                        }
+                    }
+                    continuation.resume(returning: result)
                 } catch {
-                    log.error("[PythonRunner.run] job threw: \(String(describing: error), privacy: .public)")
                     continuation.resume(throwing: error)
                 }
             }
             switch priority {
             case .high: highPriority.append(job)
-            case .low:  lowPriority.append(job)
+            case .low: lowPriority.append(job)
             }
-            log.info("[PythonRunner.run] enqueued; spawning pump (queue high=\(self.highPriority.count, privacy: .public) low=\(self.lowPriority.count, privacy: .public) isRunning=\(self.isRunning, privacy: .public))")
-            // Spawn a pump task — if one's already running it's a no-op, otherwise it drains
-            // the queues sequentially. Detached to keep the priority on the work, not on the
-            // caller (a UI-tap-priority caller shouldn't pin the entire download chain to that
-            // priority — see `.utility` choice in the pump loop).
-            Task { await self.pump() }
+            guard !isRunning else { return }
+            isRunning = true
+            Task { await drain() }
         }
     }
 
-    /// Run an arbitrary Python-touching closure serialized through this runner's FIFO.
-    /// Use for one-off operations that need a Python interpreter (e.g. `YtDlpUpdater`'s
-    /// post-download version read via `Python.attemptImport("yt_dlp")`) so they never
-    /// race in-flight yt-dlp work on a different cooperative-pool worker.
-    ///
-    /// **Always jumps to `.high` priority** — these are short, user-facing operations
-    /// (a stuck version read holds up Settings UI feedback). The yt-dlp lane has its own
-    /// `.high` for play-now taps, so `runIsolated` work and a play-now tap still interleave
-    /// fairly, just both ahead of any background backlog.
-    ///
-    /// Same execution context as `run(argv:)`: a `Task.detached(priority: .utility)`
-    /// inside `pump()`. Don't put SwiftUI / main-actor work in here — only Python.
-    func runIsolated<T: Sendable>(_ work: @Sendable @escaping () async throws -> T) async throws -> T {
-        log.info("[PythonRunner.runIsolated] enqueue (queue high=\(self.highPriority.count, privacy: .public) low=\(self.lowPriority.count, privacy: .public) isRunning=\(self.isRunning, privacy: .public))")
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
-            let log = self.log
-            let job: Job = {
-                log.info("[PythonRunner.runIsolated] job starting work closure")
-                do {
-                    let result = try await work()
-                    log.info("[PythonRunner.runIsolated] work returned successfully")
-                    continuation.resume(returning: result)
-                } catch {
-                    log.error("[PythonRunner.runIsolated] work threw: \(String(describing: error), privacy: .public)")
-                    continuation.resume(throwing: error)
+    private func drain() async {
+        while !highPriority.isEmpty || !lowPriority.isEmpty {
+            let job = highPriority.isEmpty ? lowPriority.removeFirst() : highPriority.removeFirst()
+            await withCheckedContinuation { continuation in
+                worker.async {
+                    job()
+                    continuation.resume(returning: ())
                 }
             }
-            highPriority.append(job)
-            log.info("[PythonRunner.runIsolated] enqueued; spawning pump")
-            Task { await self.pump() }
         }
+        isRunning = false
     }
 
-    /// Drains the queues one ticket at a time. Always pulls from `highPriority` first, so a
-    /// `.high` arrival during a long `.low` backlog runs immediately after the currently-executing
-    /// item — not at the end of the queue.
-    ///
-    /// **Why `freetube_yt_dlp(...)` instead of the package's `yt_dlp(...)`:** the package's
-    /// function doesn't expose a splice point between `injectFakePopen` (which replaces
-    /// `subprocess.Popen` with an ffmpeg-only `Pop`) and `ydl.download`. We need to insert
-    /// `PythonJSBridge.install()` at exactly that point so yt-dlp's `deno`-based n-cipher
-    /// solver transparently routes through our JavaScriptCore shim. See
-    /// `Core/JavaScript/FreeTubeYtDlp.swift` for the longer rationale.
-    ///
-    /// **Why `Task.detached(priority: .utility) { ... }` and NOT plain `Task { ... }`:** this
-    /// project has `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` set. Under that setting, an
-    /// unstructured `Task { ... }` closure (with no explicit isolation) is treated as
-    /// `@MainActor` — even when created from inside a non-main actor like `PythonRunner`. The
-    /// inner `try await freetube_yt_dlp(...)` would then execute on the main thread, dragging
-    /// every Python eval, SSL handshake, and yt-dlp extractor call onto main and producing
-    /// a long "main thread hung" stack (visible as `_ssl__SSLSocket_do_handshake` → … →
-    /// `freetube_yt_dlp` → `closure #1 in PythonRunner.pump()` on Thread 1).
-    ///
-    /// `Task.detached` is the explicit "do NOT inherit isolation" form — it always runs in a
-    /// nonisolated context (cooperative thread pool). That's also the historical behavior the
-    /// PythonRunner architecture was designed for: CPython runs on a stable cooperative-pool
-    /// worker, off the main thread, off the PythonSerialExecutor queue (so GCD priority
-    /// escalation from main awaiting `.utility` doesn't apply either).
-    ///
-    /// **Don't change this back to plain `Task { ... }` without also turning off
-    /// `SWIFT_DEFAULT_ACTOR_ISOLATION` for this file.** Plain `Task` only worked before that
-    /// build setting was introduced.
-    /// `@_optimize(none)` is intentionally kept here even though the project-level
-    /// `SWIFT_OPTIMIZATION_LEVEL = "-Onone"` for Release already disables optimization.
-    /// It belongs to the diagnostic-clutter set noted in commit 137ead99 ("All 19 critical
-    /// PythonKit dlsym symbols present") that should only be reverted **one at a time,**
-    /// after each TestFlight build confirms the previous step still works. Reverting all
-    /// three (this annotation + the two pbxproj knobs) at once is what caused the
-    /// TestFlight hang where yt-dlp update + Link probe spin forever — Swift's whole-module
-    /// optimizer breaks the PythonKit/CPython single-thread interpreter discipline.
-    @_optimize(none)
-    private func pump() async {
-        guard !isRunning else {
-            log.info("[PythonRunner.pump] already running, exiting")
-            return
-        }
-        isRunning = true
-        defer {
-            isRunning = false
-            log.info("[PythonRunner.pump] queue drained, exiting")
-        }
-        log.info("[PythonRunner.pump] entering drain loop (high=\(self.highPriority.count, privacy: .public) low=\(self.lowPriority.count, privacy: .public))")
-
-        var ticketNumber = 0
-        while let job = takeNext() {
-            ticketNumber += 1
-            let n = ticketNumber
-            log.info("[PythonRunner.pump] ticket #\(n, privacy: .public) starting on detached .utility task")
-            // Each job already owns its continuation and handles its own throwing; we just
-            // run it on the cooperative pool and wait for completion before pulling the
-            // next item. Strict serialization — never two Python interpreters at once.
-            let task = Task.detached(priority: .utility) {
-                await job()
-            }
-            _ = await task.value
-            log.info("[PythonRunner.pump] ticket #\(n, privacy: .public) finished; next…")
-        }
-    }
-
-    private func takeNext() -> Job? {
-        if !highPriority.isEmpty { return highPriority.removeFirst() }
-        if !lowPriority.isEmpty { return lowPriority.removeFirst() }
-        return nil
+    private nonisolated struct PythonJobError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
     }
 }
 
@@ -255,36 +135,12 @@ actor FFmpegRunner {
     }
 }
 
-/// `SerialExecutor` that dispatches all jobs to a single serial `DispatchQueue`. The queue's
-/// worker-thread stability is what makes Python happy — Python's per-thread state was set up
-/// on whichever worker handled the first job and stays valid because GCD reuses the same worker
-/// for the queue's subsequent jobs.
-@available(iOS 17.0, *)
-final class PythonSerialExecutor: SerialExecutor, @unchecked Sendable {
-    // `.utility` keeps the Python thread off `.userInitiated` priority — downloads are
-    // background work, not UI-blocking, so they shouldn't compete with the main thread for
-    // CPU. With `.userInitiated`, list scrolling visibly stuttered while yt-dlp was reading
-    // SSL data.
-    private let queue = DispatchQueue(label: "com.leshko.freetube.python", qos: .utility)
-
-    func enqueue(_ job: UnownedJob) {
-        let unowned = asUnownedSerialExecutor()
-        queue.async {
-            job.runSynchronously(on: unowned)
-        }
-    }
-
-    func asUnownedSerialExecutor() -> UnownedSerialExecutor {
-        UnownedSerialExecutor(ordinary: self)
-    }
-}
-
-/// Owns the on-disk video cache, runs YoutubeDL-iOS to fetch new ones, and surfaces progress so UI
+/// Owns the on-disk video cache, uses yt-dlp to fetch new ones, and surfaces progress so UI
 /// can render a live transfer queue.
 ///
 /// **Playback contract (CLAUDE.md §7 amended):**
 /// Every play tap calls `ensureDownloaded(video:quality:)`. If `Documents/<id>.mp4` already
-/// exists, we return immediately. Otherwise we kick off a yt-dlp run (via `YoutubeDL.yt_dlp(argv:)`),
+/// exists, we return immediately. Otherwise we kick off a yt-dlp run (via `PythonRunner`),
 /// wait for it, write a `DownloadMetadata` xattr to the resulting file, and hand the local URL back to the resolver. This
 /// sidesteps every PoT/cookie/HLS edge case in YouTube's CDN — the bytes are on disk before
 /// AVPlayer ever sees them.
@@ -549,7 +405,7 @@ final class DownloadManager: TemporaryDownloading {
         ))
 
         do {
-            log.info("yt-dlp[\(video.id, privacy: .public)] invoking yt_dlp() — first launch triggers Python module download (serialized on dedicated thread via PythonRunner)")
+            log.info("yt-dlp[\(video.id, privacy: .public)] invoking yt-dlp via PythonRunner")
             try await PythonRunner.shared.run(argv: argv, progress: { [weak self] dict in
                 guard let self else { return }
                 // CRITICAL: PythonKit's `PythonObject` is reference-counted on Python's GIL thread.
@@ -602,7 +458,7 @@ final class DownloadManager: TemporaryDownloading {
                 // the progress overlay to a spinner ("Processing…") instead of leaving it at 100%.
                 if message.contains("[Merger]") || message.contains("[ExtractAudio]") || message.contains("Fixup") {
                     let id = video.id
-                    Task { @MainActor in
+                    Task { @MainActor [weak self] in
                         self?.progressByVideoID.removeValue(forKey: id)
                     }
                 }

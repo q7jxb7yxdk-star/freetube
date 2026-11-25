@@ -17,7 +17,16 @@ import SwiftData
 @available(iOS 17.0, *)
 @ModelActor
 actor PersistenceWriter {
-    static let shared = PersistenceWriter(modelContainer: PersistenceController.sharedContainer)
+    @MainActor private static let sharedTask: Task<PersistenceWriter, Never> = {
+        let container = PersistenceController.sharedContainer
+        return Task.detached {
+            PersistenceWriter(modelContainer: container)
+        }
+    }()
+
+    @MainActor static var shared: PersistenceWriter {
+        get async { await sharedTask.value }
+    }
 
     // MARK: - WatchHistoryEntry
 

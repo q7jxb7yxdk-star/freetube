@@ -200,6 +200,7 @@ final class LogFileWriter {
     private nonisolated static func format(entry: OSLogEntryLog) -> String {
         let level: String
         switch entry.level {
+        case .undefined: level = "?"
         case .debug: level = "DEBUG"
         case .info: level = "INFO"
         case .notice: level = "NOTICE"
@@ -207,15 +208,9 @@ final class LogFileWriter {
         case .fault: level = "FAULT"
         @unknown default: level = "?"
         }
-        let ts = isoTimestampFormatter.string(from: entry.date)
+        let ts = entry.date.formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
         return "[\(ts)] [\(level)] [\(entry.category)] \(entry.composedMessage)\n"
     }
-
-    private nonisolated static let isoTimestampFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
 
     // MARK: - File header
 
@@ -239,7 +234,7 @@ final class LogFileWriter {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "?"
         let build = info["CFBundleVersion"] as? String ?? "?"
-        let launch = Self.isoTimestampFormatter.string(from: Date())
+        let launch = Date().formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
         let header = """
         =============================================
          FreeTube log

@@ -3,7 +3,7 @@ import YouTubeKit
 
 /// Maps YouTubeKit response types into the app's domain models. Lives in `Core/Networking/` per
 /// CLAUDE.md §6 — services use these helpers; nothing outside this folder should see YouTubeKit types.
-enum Mappers {
+nonisolated enum Mappers {
 
     // MARK: - Thumbnails
 
@@ -167,6 +167,7 @@ enum Mappers {
             channelName: yt.channel?.name,
             thumbnailURL: bestThumbnailURL(yt.thumbnails),
             videoCount: Int(yt.videoCount ?? ""),
+            viewCount: nil,
             descriptionText: nil,
             isOwnedByUser: false
         )
@@ -194,7 +195,7 @@ enum Mappers {
 
     // MARK: - Formats
 
-    static func format(from yt: any DownloadFormat) -> VideoFormat {
+    static func format(from yt: any AdaptiveDownloadFormat) -> VideoFormat {
         let mime = yt.mimeType ?? ""
         if let video = yt as? VideoDownloadFormat {
             return VideoFormat(
