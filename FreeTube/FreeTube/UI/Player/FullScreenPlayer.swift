@@ -30,6 +30,7 @@ struct FullScreenPlayer: View {
     /// File URL the user wants to hand off to another app via the system "Open in…" share sheet.
     /// Non-nil → present the activity controller; tapped row sets this, sheet dismissal clears it.
     @State private var shareFileURL: URL?
+    @State private var downloadError: ErrorState?
     /// Currently-pushed channel (nil = panel mode). When non-nil, the lower section swaps the
     /// metadata + comments/queue panel for a NavigationStack rooted at `ChannelScreen`. Keeping
     /// the NavigationStack **conditionally mounted** is what makes the panel-mode background
@@ -70,14 +71,14 @@ struct FullScreenPlayer: View {
         GeometryReader { proxy in
             VStack(spacing: 0) {
                 // Pinning the ZStack to width × width*9/16 keeps the surface a stable height
-                // across .resolving → .downloading → .readyToPlay (the underlying
+                // across .resolving → .readyToPlay (the underlying
                 // AVPlayerViewController has zero intrinsic size while loading; the explicit
                 // frame here is what stops the layout from jumping when the user taps a queue
                 // item).
                 ZStack {
                     Color.black
                     PlayerSurface(player: player.player)
-                    DownloadProgressOverlay(state: player.loadState)
+                    PlaybackStatusOverlay(state: player.loadState)
                 }
                 .frame(width: proxy.size.width, height: proxy.size.width * 9 / 16)
             // Pull-down-to-dismiss starting from the video surface.
@@ -171,6 +172,20 @@ struct FullScreenPlayer: View {
         // owns its own playlist fetch + "Create new playlist" form — we just hand it the video.
         .sheet(item: $addToPlaylistVideo) { video in
             AddToPlaylistSheet(videoID: video.id, videoTitle: video.title)
+        }
+        .alert("Download", isPresented: Binding(
+            get: { downloadError != nil },
+            set: { if !$0 { downloadError = nil } }
+        ), presenting: downloadError) { _ in
+            Button("OK", role: .cancel) {}
+        } message: { error in
+            Text(error.message)
+        }
+        .alert("Couldn't change resolution", isPresented: Binding(
+            get: { player.resolutionChangeFailed },
+            set: { player.resolutionChangeFailed = $0 }
+        )) {
+            Button("OK", role: .cancel) {}
         }
         // Pull-down-to-dismiss is handled by LNPopupUI via `.popupInteractionStyle(...)` in
         // RootView. We don't install a custom DragGesture here — it would race with the system
@@ -580,6 +595,9 @@ struct FullScreenPlayer: View {
     private var moreActionsMenu: some View {
         Menu {
             if let video = player.currentVideo {
+                resolutionMenu
+                Divider()
+                let localFile = DownloadManager.shared.localFile(for: video.id)
                 Button {
                     if let url = watchURL(video) {
                         UIApplication.shared.open(url)
@@ -592,12 +610,14 @@ struct FullScreenPlayer: View {
                 // a `Menu` it sometimes serializes the URL as text and the share sheet doesn't
                 // show the apps that handle the mp4 UTType. Going through `UIActivityViewController`
                 // directly is the reliable path for file activity items.
-                if let localFile = DownloadManager.shared.localFile(for: video.id) {
+                if let localFile {
                     Button {
                         shareFileURL = localFile
                     } label: {
                         Label("Open in…", systemImage: "square.and.arrow.up")
                     }
+                } else if !player.isFromURLFile {
+                    VideoDownloadMenuButton(video: video) { downloadError = $0 }
                 }
                 Button {
                     if let url = watchURL(video) {
@@ -631,7 +651,7 @@ struct FullScreenPlayer: View {
                         Label("Add to playlist", systemImage: "text.badge.plus")
                     }
                 }
-                if DownloadManager.shared.localFile(for: video.id) != nil {
+                if localFile != nil {
                     Divider()
                     Button(role: .destructive) {
                         DownloadManager.shared.deleteDownloaded(videoID: video.id, context: modelContext)
@@ -643,6 +663,42 @@ struct FullScreenPlayer: View {
         } label: {
             Image(systemName: "ellipsis.circle")
                 .font(.title2)
+        }
+    }
+
+    @ViewBuilder
+    private var resolutionMenu: some View {
+        let options = player.streamResolutionOptions
+        if options.isEmpty {
+            resolutionTitle
+        } else {
+            Menu {
+                Picker(selection: Binding(
+                    get: { player.selectedStreamResolution },
+                    set: { player.changeStreamResolution(to: $0) }
+                )) {
+                    Text("Follow settings").tag(nil as Int?)
+                    ForEach(options, id: \.self) { resolution in
+                        Text(verbatim: "\(resolution)p").tag(Optional(resolution))
+                    }
+                } label: {
+                    Text("Resolution")
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label { resolutionTitle } icon: { Image(systemName: "tv") }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var resolutionTitle: some View {
+        if let resolution = player.playbackResolution {
+            Text("Resolution · \(resolution)p")
+        } else if player.streamResolutionOptions.isEmpty {
+            Text("Resolution unavailable")
+        } else {
+            Text("Resolution")
         }
     }
 

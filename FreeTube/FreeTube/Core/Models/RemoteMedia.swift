@@ -43,6 +43,10 @@ nonisolated struct RemoteFormat: Identifiable, Sendable, Hashable {
     /// segment URL depending on `protocolKind`. nil only for cipher-locked or DRM-locked
     /// formats yt-dlp couldn't resolve.
     let url: URL?
+    /// Parent playlist for an HLS rendition, which can associate separate audio and video tracks.
+    let manifestURL: URL?
+    /// yt-dlp can identify an HLS audio rendition by its absent video track even without an audio codec.
+    let isHLSAudioRendition: Bool
     /// File extension yt-dlp would write (mp4, m4a, webm, mp3, opus).
     let ext: String
     let width: Int?

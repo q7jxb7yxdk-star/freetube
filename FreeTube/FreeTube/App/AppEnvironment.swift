@@ -57,7 +57,7 @@ final class AppEnvironment {
                    return a.join('');
                  })()
                  """,
-                 expected: "fdd&47"),
+                 expected: "fed654"),
             Case(name: "exception is captured",
                  code: "throw new Error('expected failure');",
                  expected: "<should throw>"),

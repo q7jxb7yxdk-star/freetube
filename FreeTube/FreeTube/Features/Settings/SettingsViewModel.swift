@@ -7,9 +7,28 @@ import Observation
 final class SettingsViewModel {
     var preferences = UserPreferences()
 
-    var preferredQuality: VideoQuality {
-        get { preferences.preferredQuality }
-        set { preferences.preferredQuality = newValue }
+    var wifiDownloadQuality: VideoQuality {
+        get {
+            access(keyPath: \.wifiDownloadQuality)
+            return preferences.wifiDownloadQuality
+        }
+        set {
+            withMutation(keyPath: \.wifiDownloadQuality) {
+                preferences.wifiDownloadQuality = newValue
+            }
+        }
+    }
+
+    var cellularDownloadQuality: VideoQuality {
+        get {
+            access(keyPath: \.cellularDownloadQuality)
+            return preferences.cellularDownloadQuality
+        }
+        set {
+            withMutation(keyPath: \.cellularDownloadQuality) {
+                preferences.cellularDownloadQuality = newValue
+            }
+        }
     }
 
     var appearanceMode: AppearanceMode {
@@ -22,19 +41,14 @@ final class SettingsViewModel {
         set { preferences.allowCellularDownloads = newValue }
     }
 
-    var alwaysDownloadBeforePlayback: Bool {
-        get { preferences.alwaysDownloadBeforePlayback }
-        set { preferences.alwaysDownloadBeforePlayback = newValue }
-    }
-
     var autoplayNext: Bool {
         get { preferences.autoplayNext }
         set { preferences.autoplayNext = newValue }
     }
 
-    var prefetchNextInQueue: Bool {
-        get { preferences.prefetchNextInQueue }
-        set { preferences.prefetchNextInQueue = newValue }
+    var syncYouTubeWatchHistory: Bool {
+        get { preferences.syncYouTubeWatchHistory }
+        set { preferences.syncYouTubeWatchHistory = newValue }
     }
 
     // MARK: - Diagnostics

@@ -84,7 +84,7 @@ struct RootView: View {
         // works the same.
         .popupInteractionStyle(UIViewController.PopupInteractionStyle.drag)
         .popupCloseButtonStyle(LNPopupCloseButton.Style.none)
-        .popupBarStyle(LNPopupBar.Style.prominent)
+        .popupBarStyle(LNPopupBar.Style.floating)
         // Explicitly enable the thin progress line at the bottom of the popup bar so playback
         // and download progress are always visible without expanding the player.
         .popupBarProgressViewStyle(.bottom)
@@ -167,19 +167,11 @@ struct RootView: View {
         }
     }
 
-    /// Mini-player leading image. While downloading we show a fixed glyph (the user can't see a
-    /// video they don't have yet); once playback is ready we swap in the real video thumbnail; if
-    /// the thumbnail isn't loaded yet (or the video lacks one), fall back to the play-rectangle.
     private var popupImage: Image {
-        switch player.loadState {
-        case .resolving, .downloading:
-            return Image(systemName: popupImageName)
-        default:
-            if let thumbnail {
-                return Image(uiImage: thumbnail)
-            }
-            return Image(systemName: "play.rectangle.fill")
+        if let thumbnail {
+            return Image(uiImage: thumbnail)
         }
+        return Image(systemName: "play.rectangle.fill")
     }
 
     private var progressValue: Float {
@@ -190,26 +182,10 @@ struct RootView: View {
         switch player.loadState {
         case .resolving:
             return "Preparing…"
-        case .downloading(let progress, let phase):
-            guard let progress else { return "Processing…" }
-            let percent = Int(progress * 100)
-            if let phase, phase == "video" || phase == "audio" {
-                return "Downloading \(phase) \(percent)%"
-            }
-            return "Downloading \(percent)%"
         case .failed(let msg):
             return msg
         case .idle, .readyToPlay:
             return player.currentVideo?.channelName ?? ""
-        }
-    }
-
-    /// Swap the mini-player's leading icon to an arrow.down.circle while we're downloading so it's
-    /// obvious the bar isn't ready to play yet.
-    private var popupImageName: String {
-        switch player.loadState {
-        case .resolving, .downloading: return "arrow.down.circle.fill"
-        default: return "play.rectangle.fill"
         }
     }
 }
@@ -293,9 +269,6 @@ struct PopupContentWrapper: View {
 
     /// Static helper for the few external callers that still want a snapshot.
     static func progress(for player: PlayerStateManager) -> Float {
-        if case .downloading(let progress, _) = player.loadState {
-            return Float(progress ?? 0)
-        }
         guard player.duration > 0 else { return 0 }
         return Float(min(1, max(0, player.elapsed / player.duration)))
     }
@@ -306,13 +279,6 @@ struct PopupContentWrapper: View {
         switch player.loadState {
         case .resolving:
             return "Preparing…"
-        case .downloading(let progress, let phase):
-            guard let progress else { return "Processing…" }
-            let percent = Int(progress * 100)
-            if let phase, phase == "video" || phase == "audio" {
-                return "Downloading \(phase) \(percent)%"
-            }
-            return "Downloading \(percent)%"
         case .failed(let msg):
             return msg
         case .idle, .readyToPlay:
@@ -321,14 +287,9 @@ struct PopupContentWrapper: View {
     }
 
     private var image: Image {
-        switch player.loadState {
-        case .resolving, .downloading:
-            return Image(systemName: "arrow.down.circle.fill")
-        default:
-            if let thumbnail {
-                return Image(uiImage: thumbnail)
-            }
-            return Image(systemName: "play.rectangle.fill")
+        if let thumbnail {
+            return Image(uiImage: thumbnail)
         }
+        return Image(systemName: "play.rectangle.fill")
     }
 }

@@ -32,20 +32,26 @@ struct SettingsScreen: View {
         return formatter.string(fromByteCount: currentCacheBytes)
     }
 
+    @ViewBuilder private var downloadQualityOptions: some View {
+        Text("Highest available").tag(VideoQuality.highest)
+        ForEach(VideoQuality.allCases.filter { ($0.heightCap ?? 0) > 0 && $0 != .auto }) { quality in
+            Text(quality.rawValue).tag(quality)
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    Picker("Preferred quality", selection: Bindable(model).preferredQuality) {
-                        ForEach(VideoQuality.allCases) { quality in
-                            Text(quality.rawValue).tag(quality)
+                Section("Playback") {
+                    Toggle("Autoplay next video", isOn: Bindable(model).autoplayNext)
+                    Toggle(isOn: Bindable(model).syncYouTubeWatchHistory) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Sync to YouTube watch history")
+                            Text("When signed in, report new video plays to your YouTube account.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                    Toggle("Autoplay next video", isOn: Bindable(model).autoplayNext)
-                } header: {
-                    Text("Playback")
-                } footer: {
-                    Text("Videos download to your device before playback. Lower qualities save space and download faster.")
                 }
 
                 Section("Search") {
@@ -53,8 +59,20 @@ struct SettingsScreen: View {
                 }
 
                 Section {
+                    Picker("Wi-Fi quality", selection: Bindable(model).wifiDownloadQuality) {
+                        downloadQualityOptions
+                    }
+                    Picker("Cellular quality", selection: Bindable(model).cellularDownloadQuality) {
+                        downloadQualityOptions
+                    }
+                } header: {
+                    Text("Video quality")
+                } footer: {
+                    Text("Applies to streaming and downloads.")
+                }
+
+                Section {
                     Toggle("Allow cellular data", isOn: Bindable(model).allowCellularDownloads)
-                    Toggle("Prefetch next video", isOn: Bindable(model).prefetchNextInQueue)
                     Picker("Cache limit", selection: Bindable(model).downloadCacheLimit) {
                         ForEach(DownloadCacheLimit.allCases) { option in
                             Text(option.displayName).tag(option)
@@ -68,7 +86,7 @@ struct SettingsScreen: View {
                 } header: {
                     Text("Downloads")
                 } footer: {
-                    Text("Currently using \(formattedCacheUsage). When the cache exceeds the limit, the oldest downloads are removed to fit.\n\nPrefetch starts a background download of the next queued video as soon as the current one plays, so tapping Next is instant. Turn off to save bandwidth.\n\nParallel fragments controls how many HLS/DASH chunks yt-dlp fetches at once inside a single download — higher values are faster on good connections; values above 8 can trigger YouTube rate-limiting.")
+                    Text("Currently using \(formattedCacheUsage). When the cache exceeds the limit, the oldest downloads are removed to fit.\n\nParallel fragments controls how many HLS/DASH chunks yt-dlp fetches at once inside a single download — higher values are faster on good connections; values above 8 can trigger YouTube rate-limiting.")
                 }
 
                 Section {

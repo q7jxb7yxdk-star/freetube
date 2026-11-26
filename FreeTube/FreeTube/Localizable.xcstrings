@@ -588,6 +588,40 @@
         }
       }
     },
+    "Applies to streaming and downloads." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gilt für Streaming und Downloads."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Se aplica a la reproducción en línea y a las descargas."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "S’applique au streaming et aux téléchargements."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Применяется к потоковому воспроизведению и загрузкам."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "適用於串流播放和下載。"
+          }
+        }
+      }
+    },
     "Autoplay next video" : {
       "localizations" : {
         "de" : {
@@ -720,6 +754,40 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Отменить выбор"
+          }
+        }
+      }
+    },
+    "Cellular quality" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qualität über Mobilfunk"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Calidad con datos móviles"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qualité sur le réseau mobile"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Качество по мобильной сети"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "流動數據畫質"
           }
         }
       }
@@ -1342,6 +1410,40 @@
         }
       }
     },
+    "Couldn't change resolution" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auflösung konnte nicht geändert werden"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo cambiar la resolución"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible de changer la résolution"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось изменить разрешение"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法更改解像度"
+          }
+        }
+      }
+    },
     "Couldn't load video" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -1549,7 +1651,6 @@
       }
     },
     "Currently using %@. When the cache exceeds the limit, the oldest downloads are removed to fit.\n\nParallel fragments controls how many HLS/DASH chunks yt-dlp fetches at once inside a single download — higher values are faster on good connections; values above 8 can trigger YouTube rate-limiting." : {
-      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -1584,6 +1685,7 @@
       }
     },
     "Currently using %@. When the cache exceeds the limit, the oldest downloads are removed to fit.\n\nPrefetch starts a background download of the next queued video as soon as the current one plays, so tapping Next is instant. Turn off to save bandwidth.\n\nParallel fragments controls how many HLS/DASH chunks yt-dlp fetches at once inside a single download — higher values are faster on good connections; values above 8 can trigger YouTube rate-limiting." : {
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -2063,7 +2165,6 @@
       }
     },
     "Downloading · see Downloads tab" : {
-      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -2477,6 +2578,40 @@
         }
       }
     },
+    "Follow settings" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen übernehmen"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seguir los ajustes"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suivre les réglages"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Как в настройках"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "依設定"
+          }
+        }
+      }
+    },
     "Format" : {
       "localizations" : {
         "de" : {
@@ -2643,6 +2778,40 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "H.264 воспроизводится на всех платформах Apple. MP3 нужен для аудио, которым вы поделитесь с приложениями, не принимающими AAC / Opus. Конвертация выполняется на устройстве через FFmpeg и может занять несколько секунд."
+          }
+        }
+      }
+    },
+    "Highest available" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Höchste verfügbare Qualität"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Máxima disponible"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Meilleure qualité disponible"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Наивысшее доступное качество"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最高可用畫質"
           }
         }
       }
@@ -3718,6 +3887,40 @@
         }
       }
     },
+    "No videos played yet" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch keine Videos abgespielt"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aún no se han reproducido vídeos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aucune vidéo visionnée pour le moment"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пока нет просмотренных видео"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "尚未播放任何影片"
+          }
+        }
+      }
+    },
     "None (audio only)" : {
       "localizations" : {
         "de" : {
@@ -3990,6 +4193,40 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "ОК"
+          }
+        }
+      }
+    },
+    "On this device" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf diesem Gerät"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "En este dispositivo"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sur cet appareil"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "На этом устройстве"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此裝置"
           }
         }
       }
@@ -4510,6 +4747,7 @@
       }
     },
     "Preferred quality" : {
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -4544,6 +4782,7 @@
       }
     },
     "Prefetch next video" : {
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -5366,6 +5605,108 @@
         }
       }
     },
+    "Resolution" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auflösung"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resolución"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Résolution"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешение"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "解像度"
+          }
+        }
+      }
+    },
+    "Resolution · %lldp" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auflösung · %lldp"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resolución · %lldp"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Résolution · %lldp"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешение · %lldp"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "解像度 · %lldp"
+          }
+        }
+      }
+    },
+    "Resolution unavailable" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auflösung nicht verfügbar"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resolución no disponible"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Résolution indisponible"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешение недоступно"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "解像度不明"
+          }
+        }
+      }
+    },
     "Restricted search mode" : {
       "localizations" : {
         "de" : {
@@ -6155,36 +6496,42 @@
         }
       }
     },
-    "Sign in to access your watch history, playlists, liked videos, and Watch Later." : {
+    "Sign in to access your YouTube history, playlists, liked videos, and Watch Later." : {
       "localizations" : {
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Melde dich an, um auf deinen Verlauf, deine Playlists, gelikten Videos und „Später ansehen“ zuzugreifen."
+            "value" : "Melde dich an, um auf deinen YouTube-Verlauf, deine Playlists, gelikten Videos und „Später ansehen“ zuzugreifen."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sign in to access your watch history, playlists, liked videos, and Watch Later."
+            "value" : "Sign in to access your YouTube history, playlists, liked videos, and Watch Later."
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Inicia sesión para acceder al historial, listas, vídeos que te gustaron y Ver más tarde."
+            "value" : "Inicia sesión para acceder al historial de YouTube, tus listas, los vídeos que te gustaron y Ver más tarde."
           }
         },
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Connectez-vous pour accéder à votre historique, vos playlists, vos vidéos aimées et « À regarder plus tard »."
+            "value" : "Connectez-vous pour accéder à votre historique YouTube, vos playlists, vos vidéos aimées et « À regarder plus tard »."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Войдите, чтобы получить доступ к истории просмотров, плейлистам, понравившимся видео и Watch Later."
+            "value" : "Войдите, чтобы получить доступ к истории просмотров YouTube, плейлистам, понравившимся видео и списку «Смотреть позже»."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "登入後即可查看 YouTube 觀看紀錄、播放清單、喜歡的影片和稍後觀看清單。"
           }
         }
       }
@@ -6629,6 +6976,40 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Подписки"
+          }
+        }
+      }
+    },
+    "Sync to YouTube watch history" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mit dem YouTube-Wiedergabeverlauf synchronisieren"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sincronizar con el historial de YouTube"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Synchroniser avec l’historique YouTube"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Синхронизировать с историей просмотров YouTube"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同步到 YouTube 觀看紀錄"
           }
         }
       }
@@ -7285,6 +7666,40 @@
         }
       }
     },
+    "Video quality" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Videoqualität"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Calidad de vídeo"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qualité vidéo"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Качество видео"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "影片畫質"
+          }
+        }
+      }
+    },
     "Video unavailable" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -7355,6 +7770,7 @@
       }
     },
     "Videos download to your device before playback. Lower qualities save space and download faster." : {
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -7424,7 +7840,6 @@
       }
     },
     "Watch history" : {
-      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -7527,6 +7942,40 @@
         }
       }
     },
+    "When signed in, report new video plays to your YouTube account." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wenn du angemeldet bist, wird die Wiedergabe neuer Videos an dein YouTube-Konto gemeldet."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Si has iniciado sesión, se registra la reproducción de vídeos nuevos en tu cuenta de YouTube."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Si vous êtes connecté, les nouvelles lectures sont signalées à votre compte YouTube."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если вы вошли в аккаунт, новые просмотры будут передаваться в ваш аккаунт YouTube."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "登入後，新播放的影片會回報至你的 YouTube 帳戶。"
+          }
+        }
+      }
+    },
     "Wi-Fi only downloads" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -7558,6 +8007,40 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Скачивать только по Wi-Fi"
+          }
+        }
+      }
+    },
+    "Wi-Fi quality" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qualität über WLAN"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Calidad por Wi-Fi"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qualité en Wi-Fi"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Качество по Wi-Fi"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wi-Fi 畫質"
           }
         }
       }
@@ -7833,6 +8316,40 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Идентификатор вашего YouTube-канала не был возвращён в ответе библиотеки. Попробуйте обновить экран библиотеки."
+          }
+        }
+      }
+    },
+    "YouTube history" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YouTube-Verlauf"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Historial de YouTube"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Historique YouTube"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История просмотров YouTube"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YouTube 觀看紀錄"
           }
         }
       }

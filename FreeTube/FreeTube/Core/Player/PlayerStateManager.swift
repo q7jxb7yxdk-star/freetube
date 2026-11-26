@@ -17,17 +17,49 @@ final class PlayerStateManager {
     enum LoadState: Equatable {
         case idle
         case resolving
-        /// File is being fetched. `progress` is 0…1 when known, nil during yt-dlp's mux/merge phase.
-        /// `phase` labels which stream is in flight ("video", "audio", "stream") so the UI can show
-        /// "Downloading video 42%" instead of two confusing identical bars in a row.
-        case downloading(progress: Double?, phase: String?)
         case readyToPlay
         case failed(String)
+    }
+
+    private enum StreamSource: String, CaseIterable, Sendable {
+        case ios = "IOS"
+        case tv = "TVHTML5"
+        case formats = "YouTubeKit formats"
+        case ytDlpVisionOS = "yt-dlp visionos"
+        case ytDlp = "yt-dlp"
+    }
+
+    private nonisolated struct StreamCandidate: Sendable {
+        enum Kind: String, Sendable {
+            case hlsMaster = "HLS master"
+            case hls = "HLS"
+            case mp4 = "MP4"
+        }
+
+        let url: URL
+        let source: StreamSource
+        let formatID: String
+        let kind: Kind
+        let height: Int?
+        let width: Int?
+        var manifestResolutions: [Int] = []
+
+        var resolution: Int? { height.map { min(width ?? $0, $0) } }
+    }
+
+    private struct HLSPlayback {
+        let candidate: StreamCandidate
+        var playlist: HLSResolutionPlaylist?
+        let loader: HLSResolutionResourceLoader?
+        let resolution: Int?
+
+        var resolutions: [Int] { playlist?.resolutions ?? Array(candidate.manifestResolutions.reversed()) }
     }
 
     // MARK: - Published state
 
     private(set) var currentVideo: Video?
+    private(set) var isFromURLFile = false
     /// Cached artwork for the current video. Used both to populate `MPNowPlayingInfoCenter`
     /// (lock-screen + Control Center) and (in the future) any in-app UI that wants a UIImage rather
     /// than the SwiftUI `Image`. Refreshed when the current video changes.
@@ -36,6 +68,15 @@ final class PlayerStateManager {
     private(set) var isPlaying: Bool = false
     private(set) var elapsed: TimeInterval = 0
     private(set) var duration: TimeInterval = 0
+    private(set) var playbackResolution: Int?
+    private(set) var selectedStreamResolution: Int?
+    var resolutionChangeFailed = false
+    var streamResolutionOptions: [Int] {
+        guard loadState == .readyToPlay, activeStreamKind != nil, !isChangingResolution else { return [] }
+        if let activeHLSPlayback { return activeHLSPlayback.resolutions }
+        let resolutions = Set(fixedStreamCandidates.compactMap(\.resolution).filter { $0 > 0 })
+        return resolutions.count > 1 ? resolutions.sorted(by: >) : []
+    }
     var miniPlayerVisible: Bool = false
     var fullScreenPresented: Bool = false
 
@@ -50,7 +91,6 @@ final class PlayerStateManager {
     // MARK: - Collaborators
 
     let queue: QueueManager
-    private let resolver: any PlaybackResolving
     private let preferences: UserPreferences
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "PlayerStateManager")
 
@@ -64,21 +104,35 @@ final class PlayerStateManager {
     ///      whenever you reach the latest item, recommendations refill behind it.
     private var queueAcceptsRecommendations = true
 
+    private var playbackResolutionTask: Task<Void, Never>?
+    private var resolutionChangeTask: Task<Void, Never>?
+    private var hlsPlaylistTask: Task<Void, Never>?
+    private var isChangingResolution = false
+    private var activeStreamKind: StreamCandidate.Kind?
+    private var activeHLSPlayback: HLSPlayback?
+    private var fixedStreamCandidates: [StreamCandidate] = []
+    private var shouldRecordWatchHistory = false
+    private struct WatchHistoryPlayback {
+        let item: AVPlayerItem
+        let report: WatchHistorySyncService.WatchTimeReporter
+        var lastSample: TimeInterval?
+    }
+    private var watchHistoryPlayback: WatchHistoryPlayback?
+    private var watchHistoryTimeJumpObserver: NSObjectProtocol?
     private var timeObserver: Any?
     private var timeControlStatusObservation: NSKeyValueObservation?
     private var statusCancellable: AnyCancellable?
     private var endObserver: NSObjectProtocol?
     private var itemStatusObservation: NSKeyValueObservation?
+    private var presentationSizeObservation: NSKeyValueObservation?
     private var itemErrorLogObservation: NSObjectProtocol?
     private var playerErrorObservation: NSKeyValueObservation?
     private var defaultRateObservation: NSKeyValueObservation?
     init(
         queue: QueueManager? = nil,
-        resolver: (any PlaybackResolving)? = nil,
         preferences: UserPreferences? = nil
     ) {
         self.queue = queue ?? QueueManager()
-        self.resolver = resolver ?? PlaybackResolver()
         self.preferences = preferences ?? UserPreferences()
         // Keep the audio track running when the player view goes off-screen (popup minimize, app
         // backgrounded). Without this, AVPlayer pauses video tracks as soon as their pixel buffer
@@ -98,37 +152,23 @@ final class PlayerStateManager {
     func tearDownObservers() {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let watchHistoryTimeJumpObserver { NotificationCenter.default.removeObserver(watchHistoryTimeJumpObserver) }
         timeObserver = nil
         endObserver = nil
+        watchHistoryTimeJumpObserver = nil
+        watchHistoryPlayback = nil
+        presentationSizeObservation?.invalidate()
     }
 
     // MARK: - Public commands
 
-    /// Loads a video for playback.
-    ///
-    /// - Parameter skipRecommendations: when `true`, suppresses the post-play "fill queue with
-    ///   YouTube recommendations" call. Pass this from explicit batch actions that already
-    ///   populated a curated queue — playlist's Play all / Shuffle all — so the user's queue
-    ///   stays exactly what they chose. Default is `false` so single-video taps from Home /
-    ///   Search / Mini-player still get the YouTube-app-style autoplay chain.
-    /// Play a local file already on disk — used by the **Link** tab's completed downloads.
-    ///
-    /// **Why a separate entry point and not `load(video:)`:** the YouTube-shaped resolver in
-    /// `resolveAndPlay` calls `DownloadManager.ensureDownloaded` which keys off `videoID` and
-    /// looks for `Documents/<id>.mp4`. URL-fetched files live under `Documents/<title>.mp4`
-    /// and don't have a YouTube `videoID`, so threading them
-    /// through the normal path would either crash or silently re-trigger a yt-dlp download.
-    /// This method skips resolution entirely — the file is already there, just play it.
-    ///
-    /// **What we skip vs the normal load path:** watch-history upsert (URL files aren't in
-    /// the YouTube `WatchHistoryEntry` schema), queue recommendation fill (no related-video
-    /// surface for arbitrary URLs), and `ensureDownloaded` (file is on disk).
-    /// **What we keep:** `currentVideo` (synthetic so the mini-player title/subtitle still
-    /// render), `miniPlayerVisible` flipped true so LNPopupUI shows the bar, NowPlayingCenter
-    /// update for lock-screen artwork, and the standard observe/loadItem flow so errors and
-    /// playback state still surface through the existing UI.
+    /// Play an already downloaded From URL file using its explicit path.
+    /// Synthetic video metadata still drives the player and Now Playing controls.
     func loadLocalFile(at fileURL: URL, title: String, source: String?, thumbnailURL: URL?) {
         log.info("loadLocalFile path=\(fileURL.path, privacy: .public) title=\"\(title, privacy: .public)\"")
+        playbackResolutionTask?.cancel()
+        playbackResolutionTask = nil
+        resetStreamResolution()
         if isPlaying { pause() }
         if !player.items().isEmpty { player.removeAllItems() }
 
@@ -150,6 +190,7 @@ final class PlayerStateManager {
             isShort: false
         )
         currentVideo = synthetic
+        isFromURLFile = true
         // Bypass the queue's YouTube-related tracking — URL files don't participate in the
         // recommendation chain. setCurrent appends to the queue dataset for upcoming-up UI;
         // we just zero it for arbitrary files.
@@ -166,12 +207,13 @@ final class PlayerStateManager {
         play()
     }
 
+    /// Loads a YouTube video. Playlist batch callers can suppress recommendations to keep their queue.
     func load(_ video: Video, autoplay: Bool = true, skipRecommendations: Bool = false) {
         log.info("load(\(video.id, privacy: .public)) autoplay=\(autoplay, privacy: .public) skipRecs=\(skipRecommendations, privacy: .public)")
         queueAcceptsRecommendations = !skipRecommendations
-        // Pause and tear down anything currently playing. Otherwise we'd keep streaming audio from
-        // the previous video while the new one's file is downloading — which is what the user kept
-        // hearing when they tapped "next" mid-download.
+        playbackResolutionTask?.cancel()
+        resetStreamResolution()
+        // Stop the previous video while the selected video's playback URL resolves.
         if isPlaying {
             log.info("load: pausing current playback before resolving new video")
             pause()
@@ -181,6 +223,7 @@ final class PlayerStateManager {
             player.removeAllItems()
         }
         currentVideo = video
+        isFromURLFile = false
         // Keep the queue coherent. Fresh taps from search/home append the video; subsequent calls
         // from `playNext()` / `playPrevious()` find it already there and just update `currentIndex`.
         queue.setCurrent(video)
@@ -192,42 +235,14 @@ final class PlayerStateManager {
         // that's what showed phantom progress bars on cells the user never played.
         elapsed = 0
         duration = 0
-        recordWatchHistory(video: video)
         refreshArtwork(for: video)
-        Task { await resolveAndPlay(video: video, autoplay: autoplay, skipRecommendations: skipRecommendations) }
-    }
-
-    private var progressObservationTask: Task<Void, Never>?
-
-    /// Polls `DownloadManager.shared.progressByVideoID` and updates `loadState` so the UI sees a
-    /// live progress bar while the file is downloading. The dictionary updates synchronously via
-    /// `@Observable`, but we still need an explicit poll loop because `loadState` lives on the
-    /// player and SwiftUI views don't observe `DownloadManager` from this file's call site.
-    private func startProgressObservation(for videoID: String) {
-        progressObservationTask?.cancel()
-        progressObservationTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                let progress = DownloadManager.shared.progressByVideoID[videoID]
-                let phase = DownloadManager.shared.phaseByVideoID[videoID]
-                if case .downloading = self.loadState {
-                    self.loadState = .downloading(progress: progress, phase: phase)
-                }
-                try? await Task.sleep(nanoseconds: 250_000_000)
-            }
+        playbackResolutionTask = Task { [weak self] in
+            await self?.resolveAndPlay(video: video, autoplay: autoplay, skipRecommendations: skipRecommendations)
         }
     }
 
-    private func stopProgressObservation() {
-        progressObservationTask?.cancel()
-        progressObservationTask = nil
-    }
-
-    /// Upserts a `WatchHistoryEntry` so the Library's "Recents" section reflects what the user
-    /// played. Same-id taps just bump `watchedAt` so the row floats to the top. The actor hop keeps
-    /// the SQL write off the main thread; @Query observers see the change automatically once the
-    /// background context saves.
-    private func recordWatchHistory(video: Video) {
+    /// Records playback locally and reports it to YouTube when synchronization is enabled.
+    private func recordWatchHistory(video: Video, item: AVPlayerItem) {
         let videoID = video.id
         let title = video.title
         let channelName = video.channelName
@@ -240,6 +255,29 @@ final class PlayerStateManager {
                 thumbnailURL: thumbnailURL
             )
         }
+        if let report = WatchHistorySyncService.shared.beginPlayback(videoID: videoID) {
+            let startTime = item.currentTime().seconds
+            watchHistoryPlayback = WatchHistoryPlayback(
+                item: item,
+                report: report,
+                lastSample: startTime.isFinite && startTime >= 0 ? startTime : nil
+            )
+        }
+    }
+
+    private func sampleWatchHistory(at time: TimeInterval) {
+        guard let playback = watchHistoryPlayback,
+              playback.item === player.currentItem,
+              player.timeControlStatus == .playing,
+              time.isFinite, time >= 0 else { return }
+
+        watchHistoryPlayback?.lastSample = time
+        guard let previous = playback.lastSample else { return }
+        let delta = time - previous
+        // Samples normally arrive every 0.5 media seconds. Keep jumps out of the reported range.
+        guard delta > 0, delta <= 1.25 else { return }
+        watchHistoryPlayback = nil
+        playback.report(previous...time)
     }
 
     func play() {
@@ -250,6 +288,7 @@ final class PlayerStateManager {
 
     func pause() {
         log.info("pause()")
+        watchHistoryPlayback?.lastSample = nil
         player.pause()
         isPlaying = false
     }
@@ -260,6 +299,7 @@ final class PlayerStateManager {
     }
 
     func seek(to seconds: TimeInterval) {
+        watchHistoryPlayback?.lastSample = nil
         log.info("seek(to: \(seconds, privacy: .public)s)")
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
@@ -268,6 +308,35 @@ final class PlayerStateManager {
     func seekRelative(by delta: TimeInterval) {
         log.info("seekRelative(by: \(delta, privacy: .public)s)")
         seek(to: max(0, min(elapsed + delta, duration)))
+    }
+
+    func changeStreamResolution(to resolution: Int?) {
+        let options = streamResolutionOptions
+        guard !options.isEmpty, resolution != selectedStreamResolution,
+              resolution.map(options.contains) ?? true, let item = player.currentItem else { return }
+
+        let quality = DownloadManager.shared.currentDownloadQuality
+        if let resolution, activeHLSPlayback?.resolution == resolution {
+            selectedStreamResolution = resolution
+            return
+        }
+
+        let candidates = fixedStreamCandidates.filter { candidate in
+            if let resolution { return candidate.resolution == resolution }
+            return quality.heightCap.map { (candidate.height ?? Int.max) <= $0 } ?? true
+        }
+        guard activeHLSPlayback != nil || !candidates.isEmpty else {
+            resolutionChangeFailed = true
+            return
+        }
+        if (item.asset as? AVURLAsset)?.url == candidates.first?.url {
+            selectedStreamResolution = resolution
+            return
+        }
+        isChangingResolution = true
+        resolutionChangeTask = Task { [weak self] in
+            await self?.switchStream(candidates, quality: quality, resolution: resolution, from: item)
+        }
     }
 
     func playNext() {
@@ -287,10 +356,12 @@ final class PlayerStateManager {
             return
         }
         log.info("playNext: queue at end, refilling recs from seed=\(seed.id, privacy: .public)")
+        let currentVideoID = currentVideo?.id
         Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.currentVideo?.id == currentVideoID else { return }
             let countBefore = self.queue.items.count
             await self.fillQueueWithRecommendations(for: seed)
+            guard self.currentVideo?.id == currentVideoID else { return }
             guard self.queue.items.count > countBefore else {
                 self.log.notice("playNext: refill produced no new items, giving up")
                 return
@@ -312,16 +383,114 @@ final class PlayerStateManager {
 
     func dismiss() {
         log.info("dismiss()")
+        playbackResolutionTask?.cancel()
+        playbackResolutionTask = nil
+        resetStreamResolution()
         pause()
         miniPlayerVisible = false
         fullScreenPresented = false
         currentVideo = nil
         loadState = .idle
+        watchHistoryPlayback = nil
         player.removeAllItems()
         NowPlayingCenter.clear()
     }
 
     // MARK: - Internals
+
+    private func resetStreamResolution() {
+        resolutionChangeTask?.cancel()
+        resolutionChangeTask = nil
+        hlsPlaylistTask?.cancel()
+        hlsPlaylistTask = nil
+        isChangingResolution = false
+        activeStreamKind = nil
+        activeHLSPlayback = nil
+        fixedStreamCandidates = []
+        playbackResolution = nil
+        selectedStreamResolution = nil
+        resolutionChangeFailed = false
+    }
+
+    private func switchStream(
+        _ candidates: [StreamCandidate], quality: VideoQuality, resolution: Int?, from previousItem: AVPlayerItem
+    ) async {
+        defer {
+            if !Task.isCancelled {
+                isChangingResolution = false
+                resolutionChangeTask = nil
+            }
+        }
+        guard !Task.isCancelled, player.currentItem === previousItem else { return }
+        let position = previousItem.currentTime()
+        let isLive = currentVideo?.isLive == true
+        let programDate = isLive ? previousItem.currentDate() : nil
+        let seekTime = !isLive && position.isNumeric && position.seconds > 0 ? position : nil
+        func restorePosition() async -> Bool {
+            if let programDate { return await player.seek(to: programDate) }
+            if let seekTime { return await player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) }
+            return true
+        }
+
+        let shouldResume = player.timeControlStatus != .paused
+        let previousKind = activeStreamKind
+        let previousHLS = activeHLSPlayback
+        let previousMediaSelection = previousItem.currentMediaSelection
+        let previousHistory = watchHistoryPlayback
+        let recordHistoryOnPlay = shouldRecordWatchHistory
+        pause()
+        loadState = .resolving
+
+        var switched: Bool
+        if let previousHLS {
+            switched = await tryHLSStream(
+                previousHLS.candidate, maxHeight: quality.heightCap, preferHighest: quality == .highest,
+                exactResolution: resolution, cachedPlaylist: previousHLS.playlist
+            )
+        } else {
+            var attempted: Set<URL> = []
+            switched = await tryStreams(candidates, maxHeight: nil, attempted: &attempted, limit: 3)
+        }
+        guard !Task.isCancelled else { return }
+        if switched { switched = await restorePosition() }
+        guard !Task.isCancelled else { return }
+        if switched, previousHLS != nil, let item = player.currentItem {
+            await restoreMediaSelection(previousMediaSelection, from: previousItem.asset, to: item)
+        }
+        guard !Task.isCancelled else { return }
+        if switched {
+            selectedStreamResolution = resolution
+        } else {
+            if player.currentItem !== previousItem { loadItem(previousItem) }
+            activateStream(previousKind, hls: previousHLS)
+            loadState = .readyToPlay
+            _ = await restorePosition()
+        }
+        guard !Task.isCancelled else { return }
+        if let item = player.currentItem, let previousHistory {
+            watchHistoryPlayback = WatchHistoryPlayback(item: item, report: previousHistory.report, lastSample: nil)
+        }
+        shouldRecordWatchHistory = recordHistoryOnPlay
+
+        if shouldResume { play() }
+        resolutionChangeFailed = !switched
+    }
+
+    private func restoreMediaSelection(_ selection: AVMediaSelection, from original: AVAsset, to item: AVPlayerItem) async {
+        for characteristic: AVMediaCharacteristic in [.audible, .legible] {
+            guard let previousGroup = try? await original.loadMediaSelectionGroup(for: characteristic),
+                  let nextGroup = try? await item.asset.loadMediaSelectionGroup(for: characteristic) else { continue }
+            guard !Task.isCancelled, player.currentItem === item else { return }
+            if let option = selection.selectedMediaOption(in: previousGroup) {
+                let match = nextGroup.mediaSelectionOption(withPropertyList: option.propertyList()) ?? nextGroup.options.first {
+                    $0.extendedLanguageTag == option.extendedLanguageTag && $0.displayName == option.displayName
+                }
+                if let match { item.select(match, in: nextGroup) }
+            } else if nextGroup.allowsEmptySelection {
+                item.select(nil, in: nextGroup)
+            }
+        }
+    }
 
     /// Swap the player to a new item using the `AVQueuePlayer`-correct pattern. `replaceCurrentItem`
     /// is documented to be a no-op when the player's internal queue is empty (which is our usual
@@ -329,30 +498,52 @@ final class PlayerStateManager {
     /// queue down to nothing first and then insert. Also wires KVO so we hear about decode/auth
     /// failures the moment they happen (CoreMedia's `CFByteFlume err=-12939` style messages don't
     /// surface a structured `NSError` otherwise).
-    private func loadItem(_ item: AVPlayerItem) {
-        let url = (item.asset as? AVURLAsset)?.url.path ?? "(non-URL asset)"
-        log.info("loadItem: removeAllItems + insert (asset=\(url, privacy: .public))")
+    private func loadItem(_ item: AVPlayerItem, isStreamCandidate: Bool = false) {
+        watchHistoryPlayback = nil
+        playbackResolution = nil
         player.removeAllItems()
+        shouldRecordWatchHistory = !isFromURLFile
         player.insert(item, after: nil)
         log.debug("loadItem: queue size after insert=\(self.player.items().count, privacy: .public)")
-        observe(item: item)
+        observe(item: item, isStreamCandidate: isStreamCandidate)
     }
 
-    private func observe(item: AVPlayerItem) {
+    private func observe(item: AVPlayerItem, isStreamCandidate: Bool) {
         itemStatusObservation?.invalidate()
+        presentationSizeObservation?.invalidate()
         if let token = itemErrorLogObservation { NotificationCenter.default.removeObserver(token) }
+
+        presentationSizeObservation = item.observe(\.presentationSize, options: [.initial, .new]) { [weak self] item, _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.player.currentItem === item else { return }
+                let size = item.presentationSize
+                let dimension = min(size.width, size.height)
+                let resolution = dimension > 0 ? Int(exactly: dimension.rounded()) : nil
+                if self.playbackResolution != resolution {
+                    self.playbackResolution = resolution
+                    if let resolution { self.log.info("Playback resolution changed to \(resolution, privacy: .public)p") }
+                }
+            }
+        }
 
         itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
             guard let self else { return }
             Task { @MainActor in
+                guard self.player.currentItem === item else { return }
                 switch item.status {
                 case .unknown:
                     self.log.info("AVPlayerItem status: unknown")
                 case .readyToPlay:
+                    if !isStreamCandidate { self.loadState = .readyToPlay }
                     self.log.info("AVPlayerItem status: readyToPlay (duration=\(item.duration.seconds, privacy: .public)s)")
                 case .failed:
-                    let err = item.error as NSError?
-                    self.log.error("AVPlayerItem status: FAILED domain=\(err?.domain ?? "?", privacy: .public) code=\(err?.code ?? 0, privacy: .public) info=\(String(describing: err?.userInfo), privacy: .public)")
+                    let error = item.error ?? YouTubeServiceError.streamExtractionFailed
+                    if !isStreamCandidate || self.loadState == .readyToPlay {
+                        self.loadState = .failed(ErrorState(from: error).message)
+                    }
+                    let details = error as NSError
+                    self.log.error("AVPlayerItem status: FAILED domain=\(details.domain, privacy: .public) code=\(details.code, privacy: .public)")
                 @unknown default:
                     break
                 }
@@ -363,180 +554,367 @@ final class PlayerStateManager {
             forName: AVPlayerItem.newErrorLogEntryNotification,
             object: item,
             queue: .main
-        ) { [weak self, weak item] _ in
-            guard let entry = item?.errorLog()?.events.last else { return }
-            self?.log.error("AVPlayerItem error-log: domain=\(entry.errorDomain, privacy: .public) code=\(entry.errorStatusCode, privacy: .public) comment=\(entry.errorComment ?? "", privacy: .public) URI=\(entry.uri ?? "", privacy: .public)")
+        ) { [log, weak item] _ in
+            guard let item else { return }
+            Task {
+                guard let entry = await item.errorLog?.events.last else { return }
+                log.error("AVPlayerItem error-log: domain=\(entry.errorDomain, privacy: .public) code=\(entry.errorStatusCode, privacy: .public)")
+            }
         }
     }
 
-    private func resolveAndPlay(video: Video, autoplay: Bool, skipRecommendations: Bool = false) async {
-        log.info("resolveAndPlay: start for \(video.id, privacy: .public)")
-        // Watch the manager's progress dictionary so the player UI can render a real-time progress
-        // bar. Cancelled in `dismiss()` and replaced on each `load`.
-        startProgressObservation(for: video.id)
-
-        // Three-tier playback resolution:
-        //   1. `ensureDownloaded` — yt-dlp into local file, then YouTubeKit progressive fallback
-        //      inside it. Returns a `file://` URL on success.
-        //   2. **HLS streaming** — last resort when every download path is blocked (PoT 403s,
-        //      cipher-decode broken, etc.). `AVPlayerItem(url:)` accepts an HLS master-playlist
-        //      URL identically to a file URL — AVFoundation handles segment fetching itself, so
-        //      we get playback without needing to predownload or decode signature ciphers. The
-        //      trade-off is no local file ⇒ the video isn't watchable offline, doesn't appear in
-        //      Downloads, and doesn't burn cache storage. But it plays.
-        let playbackURL: URL
-        do {
-            loadState = .downloading(progress: 0, phase: nil)
-            // `.userInitiated` priority — the user just tapped Play and is actively waiting.
-            // If a long background queue (playlist Download All) is in flight, this jumps the
-            // line so playback starts as soon as the currently-running yt-dlp finishes, instead
-            // of after every queued download.
-            playbackURL = try await DownloadManager.shared.ensureDownloaded(
-                video: video,
-                quality: preferences.preferredQuality,
-                priority: .userInitiated
-            )
-            log.info("resolveAndPlay: local file \(playbackURL.path, privacy: .public)")
-        } catch {
-            log.error("resolveAndPlay: download path FAILED for \(video.id, privacy: .public): \(String(describing: error), privacy: .public) — trying remote stream")
-            if let streamURL = await resolveStreamingURL(videoID: video.id, quality: preferences.preferredQuality) {
-                log.info("resolveAndPlay: streaming \(streamURL.absoluteString, privacy: .public)")
-                playbackURL = streamURL
-            } else {
-                log.error("resolveAndPlay: streaming fallback also unavailable for \(video.id, privacy: .public)")
-                loadState = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-                stopProgressObservation()
+    private func resolveAndPlay(video: Video, autoplay: Bool, skipRecommendations: Bool) async {
+        guard !Task.isCancelled else { return }
+        if let localFile = DownloadManager.shared.localFile(for: video.id) {
+            loadItem(AVPlayerItem(url: localFile))
+        } else {
+            let started = await startStreaming(videoID: video.id)
+            guard !Task.isCancelled else { return }
+            guard started else {
+                loadState = .failed(ErrorState(from: YouTubeServiceError.streamExtractionFailed).message)
                 return
             }
         }
-        let item = AVPlayerItem(url: playbackURL)
-        loadItem(item)
-        loadState = .readyToPlay
+
         updateNowPlaying()
         if autoplay { play() }
-        stopProgressObservation()
-        log.info("resolveAndPlay: finished happy-path for \(video.id, privacy: .public)")
-        // Fire-and-forget queue fill — uses YouTube's `/next` (WEB) endpoint, independent of the
-        // resolver's `/player` (IOS) endpoint, so it can't interfere with playback that's already
-        // running. Failures are logged but never surface to the user; queue stays as-is on error.
-        //
-        // Suppressed only when the caller explicitly asks (playlist's Play all / Shuffle all).
-        // Every other entry point — single video taps from Home/Search/Mini-player, queue-row
-        // taps, Next/Previous, and even tapping an individual playlist video — gets the
-        // autoplay-style recommendation fill, so the player keeps advancing past the seed.
-        // Background-prefetch the **single** next queue item so it's ready when the user taps Next
-        // (or auto-advance kicks in). We deliberately only preload one — `PythonRunner` serializes
-        // every yt-dlp invocation and we don't want a long preload chain blocking the user's
-        // explicit play taps. The current item is already fully on disk and playing from local
-        // file at this point, so kicking off the next download doesn't interrupt anything.
-        //
-        // **Ordering matters.** For non-playlist taps, the queue starts with just `[currentVideo]`
-        // — recommendations haven't arrived yet. If we fire prefetch here unconditionally,
-        // `queue.upcomingItems(count: 1)` returns empty and the prefetch silently no-ops. So:
-        //   - Playlist Play All / Shuffle All path (`skipRecommendations: true`): the caller has
-        //     pre-populated the queue, so prefetch can run immediately.
-        //   - Default path (recommendations enabled): defer prefetch to the tail of the
-        //     recommendations Task so it sees the freshly-appended "up next".
         if !skipRecommendations {
-            Task { [weak self] in
-                await self?.fillQueueWithRecommendations(for: video)
-                self?.prefetchNextUpcoming()
-            }
-        } else {
-            prefetchNextUpcoming()
+            await fillQueueWithRecommendations(for: video)
         }
     }
 
-    /// Fires `DownloadManager.ensureDownloaded` for just the next queued video, in the background.
-    /// Idempotent: returns instantly if the file is already on disk, and coalesces with any
-    /// existing in-flight download for the same ID, so re-prefetching on every successful play is
-    /// cheap.
-    ///
-    /// **User-gated** by `UserPreferences.prefetchNextInQueue`. Off → no background download
-    /// is started; Next-tap will then fall into the standard `ensureDownloaded` path with
-    /// `.userInitiated` priority (still works, just no head-start).
-    private func prefetchNextUpcoming() {
-        guard preferences.prefetchNextInQueue else {
-            log.debug("prefetch: disabled in settings, skipping")
+    private func startStreaming(videoID: String) async -> Bool {
+        let quality = DownloadManager.shared.currentDownloadQuality
+        log.info("Resolving stream quality=\(quality.rawValue, privacy: .public)")
+        if quality == .highest { return await startHighestStream(videoID: videoID) }
+
+        let maxHeight = quality.heightCap
+        var attempted: Set<URL> = []
+        var fixedStreams: [StreamCandidate] = []
+
+        for source in StreamSource.allCases {
+            guard !Task.isCancelled else { return false }
+            let candidates = await streamCandidates(videoID: videoID, source: source)
+            fixedStreams.append(contentsOf: candidates.filter { $0.kind != .hlsMaster })
+            let masters = candidates.filter { $0.kind == .hlsMaster }
+            let limit = source == .ytDlp || source == .ytDlpVisionOS ? 2 : 1
+            if await tryStreams(masters, maxHeight: maxHeight, attempted: &attempted, limit: limit) {
+                return true
+            }
+        }
+
+        guard !Task.isCancelled else { return false }
+        fixedStreamCandidates = fixedStreams.sorted { ($0.height ?? 0) > ($1.height ?? 0) }
+        let eligible = fixedStreamCandidates.filter { candidate in
+            maxHeight.map { (candidate.height ?? Int.max) <= $0 } ?? true
+        }
+        return await tryStreams(eligible, maxHeight: maxHeight, attempted: &attempted, limit: 3)
+    }
+
+    private func streamCandidates(videoID: String, source: StreamSource) async -> [StreamCandidate] {
+        let service = VideoService()
+        switch source {
+        case .ios:
+            guard let info = try? await service.fetchInfo(id: videoID) else { return [] }
+            return Self.nativeStreams(info, formats: info.formats, source: source)
+        case .tv:
+            guard let info = try? await service.fetchInfoViaTVHTML5(id: videoID) else { return [] }
+            return Self.nativeStreams(info, formats: info.formats, source: source)
+        case .formats:
+            guard let result = try? await service.fetchInfoWithFormats(id: videoID) else { return [] }
+            return Self.nativeStreams(result.info, formats: result.formats, source: source)
+        case .ytDlpVisionOS, .ytDlp:
+            do {
+                let media = try await YtDlpInfoService().probe(
+                    url: "https://www.youtube.com/watch?v=\(videoID)", useVisionOSClient: source == .ytDlpVisionOS
+                )
+                let candidates = Self.probedStreams(from: media.formats, source: source)
+                if candidates.isEmpty, !Task.isCancelled {
+                    log.notice("\(source.rawValue, privacy: .public) found no compatible stream for \(videoID, privacy: .public)")
+                }
+                return candidates
+            } catch {
+                if !Task.isCancelled {
+                    log.notice("\(source.rawValue, privacy: .public) playback probe failed for \(videoID, privacy: .public)")
+                }
+                return []
+            }
+        }
+    }
+
+    private func startHighestStream(videoID: String) async -> Bool {
+        let sources = StreamSource.allCases
+        let (results, continuation) = AsyncStream<(StreamSource?, [StreamCandidate])>.makeStream()
+        let lookups = sources.filter { $0 != .ytDlp }.map { source in
+            Task { @MainActor in
+                let candidates = await self.inspectStreamCandidates(videoID: videoID, source: source)
+                guard !Task.isCancelled else { return }
+                continuation.yield((source, candidates))
+                if source == .ytDlpVisionOS {
+                    let fallback = candidates.contains { $0.kind == .hlsMaster }
+                        ? [] : await self.inspectStreamCandidates(videoID: videoID, source: .ytDlp)
+                    guard !Task.isCancelled else { return }
+                    continuation.yield((.ytDlp, fallback))
+                }
+            }
+        }
+        let comparisonDeadline = Task {
+            try? await Task.sleep(for: .seconds(5))
+            if !Task.isCancelled { continuation.yield((nil, [])) }
+        }
+        defer {
+            comparisonDeadline.cancel()
+            for lookup in lookups { lookup.cancel() }
+            continuation.finish()
+        }
+
+        var iterator = results.makeAsyncIterator()
+        var received: [StreamSource: [StreamCandidate]] = [:]
+        var attempted: Set<URL> = []
+        var comparisonExpired = false
+        // Start comparing after five seconds if any candidates are ready. The yt-dlp probe
+        // shares a worker with downloads, so it may still be waiting by then.
+        while received.count < sources.count, let (source, candidates) = await iterator.next() {
+            if let source {
+                received[source] = candidates
+            } else {
+                comparisonExpired = true
+            }
+            if comparisonExpired, received.values.contains(where: { !$0.isEmpty }) { break }
+        }
+
+        while !Task.isCancelled {
+            let ranked = sources.flatMap { received[$0] ?? [] }.sorted { lhs, rhs in
+                let lhsResolution = lhs.manifestResolutions.last ?? lhs.resolution ?? 0
+                let rhsResolution = rhs.manifestResolutions.last ?? rhs.resolution ?? 0
+                if lhsResolution != rhsResolution { return lhsResolution > rhsResolution }
+                return lhs.kind == .hlsMaster && rhs.kind != .hlsMaster
+            }
+            fixedStreamCandidates = ranked.filter { $0.kind != .hlsMaster }
+            if await tryStreams(ranked, maxHeight: nil, attempted: &attempted, limit: 8 - attempted.count, preferHighestHLS: true) {
+                return true
+            }
+            guard attempted.count < 8, received.count < sources.count,
+                  let (source, candidates) = await iterator.next() else { break }
+            if let source { received[source] = candidates }
+        }
+
+        // An advertised visionOS playlist can still fail preparation on this device.
+        guard !Task.isCancelled, received[.ytDlpVisionOS]?.contains(where: { $0.kind == .hlsMaster }) == true else { return false }
+        let fallback = await inspectStreamCandidates(videoID: videoID, source: .ytDlp)
+        guard !Task.isCancelled else { return false }
+        fixedStreamCandidates.append(contentsOf: fallback.filter { $0.kind != .hlsMaster })
+        fixedStreamCandidates.sort { ($0.resolution ?? 0) > ($1.resolution ?? 0) }
+        return await tryStreams(fallback, maxHeight: nil, attempted: &attempted, limit: 3, preferHighestHLS: true)
+    }
+
+    private func inspectStreamCandidates(videoID: String, source: StreamSource) async -> [StreamCandidate] {
+        var candidates = await streamCandidates(videoID: videoID, source: source)
+        for index in candidates.indices where candidates[index].kind == .hlsMaster {
+            guard !Task.isCancelled else { return [] }
+            if candidates[index].manifestResolutions.isEmpty {
+                candidates[index].manifestResolutions = await hlsResolutions(at: candidates[index].url)
+            }
+            let label = candidates[index].manifestResolutions.map { "\($0)p" }.joined(separator: ", ")
+            log.info("HLS resolutions from \(source.rawValue, privacy: .public): \(label.isEmpty ? "unknown" : label, privacy: .public)")
+        }
+        return candidates
+    }
+
+    private func hlsResolutions(at url: URL) async -> [Int] {
+        let asset = AVURLAsset(url: url)
+        let deadline = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            if !Task.isCancelled { asset.cancelLoading() }
+        }
+        defer { deadline.cancel() }
+        guard let variants = try? await asset.load(.variants) else { return [] }
+        let resolutions = variants.compactMap { variant -> Int? in
+            guard let size = variant.videoAttributes?.presentationSize else { return nil }
+            let dimension = min(size.width, size.height)
+            return dimension > 0 ? Int(exactly: dimension.rounded()) : nil
+        }
+        return Set(resolutions).sorted()
+    }
+
+    private func applyStreamLimit(_ resolution: Int?, to item: AVPlayerItem) {
+        guard let resolution else {
+            item.preferredMaximumResolution = .zero
             return
         }
-        guard let next = queue.upcomingItems(count: 1).first else { return }
-        log.info("prefetch: queuing \(next.id, privacy: .public) for background download")
-        Task { [preferredQuality = preferences.preferredQuality] in
-            _ = try? await DownloadManager.shared.ensureDownloaded(
-                video: next,
-                quality: preferredQuality
+        // Allow standard 16:9 and wider cinema variants at the selected resolution.
+        item.preferredMaximumResolution = CGSize(width: resolution * 2, height: resolution)
+    }
+
+    private func tryStreams(
+        _ candidates: [StreamCandidate], maxHeight: Int?, attempted: inout Set<URL>, limit: Int, preferHighestHLS: Bool = false
+    ) async -> Bool {
+        var remaining = limit
+        for candidate in candidates {
+            guard remaining > 0, !Task.isCancelled else { return false }
+            guard attempted.insert(candidate.url).inserted else { continue }
+            remaining -= 1
+
+            if candidate.kind == .hlsMaster {
+                if await tryHLSStream(candidate, maxHeight: maxHeight, preferHighest: preferHighestHLS) { return true }
+            } else if await prepareStream(AVPlayerItem(url: candidate.url), label: streamLabel(candidate)) {
+                activateStream(candidate.kind)
+                loadState = .readyToPlay
+                return true
+            }
+        }
+        return false
+    }
+
+    private func tryHLSStream(
+        _ candidate: StreamCandidate, maxHeight: Int?, preferHighest: Bool,
+        exactResolution: Int? = nil, cachedPlaylist: HLSResolutionPlaylist? = nil
+    ) async -> Bool {
+        var playlist = cachedPlaylist
+        if playlist == nil, preferHighest || exactResolution != nil {
+            playlist = try? await HLSResolutionPlaylist.load(from: candidate.url)
+        }
+        guard !Task.isCancelled else { return false }
+
+        let label = streamLabel(candidate)
+        if let playlist {
+            let attempts = exactResolution.map { [$0] } ?? (preferHighest ? Array(playlist.resolutions.prefix(3)) : [])
+            for resolution in attempts {
+                guard !Task.isCancelled else { return false }
+                guard let playback = playlist.makePlayback(resolution: resolution) else { continue }
+                let item = AVPlayerItem(asset: playback.asset)
+                let timeout: Duration = exactResolution == nil ? .seconds(4) : .seconds(8)
+                guard await prepareStream(item, label: "\(label) selected=\(resolution)p", expectedResolution: resolution, timeout: timeout) else { continue }
+                activateStream(.hlsMaster, hls: HLSPlayback(candidate: candidate, playlist: playlist, loader: playback.loader, resolution: resolution))
+                loadState = .readyToPlay
+                return true
+            }
+        }
+
+        guard exactResolution == nil, !Task.isCancelled else { return false }
+        let item = AVPlayerItem(url: candidate.url)
+        applyStreamLimit(maxHeight, to: item)
+        guard await prepareStream(item, label: "\(label) adaptive") else { return false }
+        activateStream(.hlsMaster, hls: HLSPlayback(candidate: candidate, playlist: playlist, loader: nil, resolution: nil))
+        loadState = .readyToPlay
+        return true
+    }
+
+    private func activateStream(_ kind: StreamCandidate.Kind?, hls: HLSPlayback? = nil) {
+        hlsPlaylistTask?.cancel()
+        hlsPlaylistTask = nil
+        activeStreamKind = kind
+        activeHLSPlayback = hls
+        guard let hls, hls.playlist == nil, hls.resolutions.isEmpty, let item = player.currentItem else { return }
+
+        let url = hls.candidate.url
+        hlsPlaylistTask = Task { [weak self, weak item] in
+            let playlist = try? await HLSResolutionPlaylist.load(from: url)
+            guard !Task.isCancelled, let self, let item, self.player.currentItem === item else { return }
+            self.activeHLSPlayback?.playlist = playlist
+            self.hlsPlaylistTask = nil
+        }
+    }
+
+    private func streamLabel(_ candidate: StreamCandidate) -> String {
+        let offered = (candidate.manifestResolutions.last ?? candidate.resolution).map { "\($0)p" } ?? "unknown"
+        return "\(candidate.source.rawValue) \(candidate.kind.rawValue) format=\(candidate.formatID) offeredMax=\(offered)"
+    }
+
+    /// Wait for preparation before requesting playback so a timed-out item cannot write to history.
+    private func prepareStream(
+        _ item: AVPlayerItem, label: String, expectedResolution: Int? = nil, timeout: Duration = .seconds(8)
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        log.info("Trying stream: \(label, privacy: .public)")
+        loadItem(item, isStreamCandidate: true)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !Task.isCancelled, player.currentItem === item, item.status == .unknown, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+
+        guard !Task.isCancelled else { return false }
+        if player.currentItem === item, item.status == .readyToPlay {
+            let size = item.presentationSize
+            let shortSide = min(size.width, size.height)
+            if let expectedResolution, shortSide > 0, abs(shortSide - CGFloat(expectedResolution)) > 16 {
+                log.notice("Stream resolution mismatch: \(label, privacy: .public) rendered=\(shortSide, privacy: .public)p")
+                player.removeAllItems()
+                return false
+            }
+            log.info("Stream ready: \(label, privacy: .public) size=\(size.width, privacy: .public)x\(size.height, privacy: .public)")
+            return true
+        }
+
+        if let error = item.error as NSError? {
+            log.notice("Stream failed: \(label, privacy: .public) domain=\(error.domain, privacy: .public) code=\(error.code, privacy: .public)")
+        } else if player.currentItem === item, item.status == .unknown {
+            log.notice("Stream preparation timed out: \(label, privacy: .public)")
+        } else {
+            log.notice("Stream item became unavailable: \(label, privacy: .public)")
+        }
+        if player.currentItem === item { player.removeAllItems() }
+        return false
+    }
+
+    private static func nativeStreams(_ info: VideoInfo, formats: [VideoFormat], source: StreamSource) -> [StreamCandidate] {
+        let manifest = info.streamingURL.map {
+            StreamCandidate(url: $0, source: source, formatID: "manifest", kind: .hlsMaster, height: nil, width: nil)
+        }
+        let progressive = formats.filter {
+            $0.containsBothTracks && $0.url != nil && $0.mimeType.lowercased().contains("mp4")
+        }
+        .compactMap { format in
+            format.url.map { StreamCandidate(url: $0, source: source, formatID: format.id, kind: .mp4, height: format.height, width: format.width) }
+        }
+        return [manifest].compactMap { $0 } + progressive
+    }
+
+    private static func probedStreams(from formats: [RemoteFormat], source: StreamSource) -> [StreamCandidate] {
+        let playable = formats.filter {
+            $0.url?.scheme?.lowercased() == "https" && $0.url?.host != nil
+        }
+        .sorted { ($0.height ?? 0) > ($1.height ?? 0) }
+        let hlsFormats = playable.filter { $0.protocolKind == .hls }
+        let manifestsWithAudio = Set(hlsFormats.filter { $0.hasAudio || $0.isHLSAudioRendition }.compactMap(\.manifestURL))
+        let videoByManifest = Dictionary(grouping: hlsFormats.filter(\.hasVideo), by: \.manifestURL)
+        var seenManifests: Set<URL> = []
+        let masters = hlsFormats.compactMap { format -> StreamCandidate? in
+            guard format.hasVideo, let url = format.manifestURL,
+                  url.scheme?.lowercased() == "https", url.host != nil,
+                  manifestsWithAudio.contains(url), seenManifests.insert(url).inserted else { return nil }
+            let resolutions = videoByManifest[url, default: []].compactMap { variant -> Int? in
+                guard let height = variant.height else { return nil }
+                return min(variant.width ?? height, height)
+            }
+            return StreamCandidate(
+                url: url, source: source, formatID: format.id, kind: .hlsMaster, height: nil, width: nil,
+                manifestResolutions: Set(resolutions.filter { $0 > 0 }).sorted()
             )
         }
-    }
-
-    /// Last-ditch URL resolver. Walks four tiers, returning the first one that produces a URL
-    /// `AVPlayer` can open directly:
-    ///   1. iOS-client HLS manifest (adaptive bitrate, best playback experience)
-    ///   2. iOS-client progressive MP4 (muxed audio+video, no n-decoding needed)
-    ///   3. TVHTML5 HLS manifest
-    ///   4. TVHTML5 progressive MP4
-    ///
-    /// Why HLS is preferred: HLS chunks use short-lived signatures attached to the manifest
-    /// rather than the player.js-derived `n` cipher, and YouTube doesn't typically PoT-stamp
-    /// HLS the way it does DASH. When HLS isn't exposed (some kids/family content), the iOS
-    /// client's `defaultFormats` still include direct progressive URLs that work without the
-    /// player.js scrape — that's our second tier. Returns nil only when all four tiers fail.
-    private func resolveStreamingURL(videoID: String, quality: VideoQuality) async -> URL? {
-        let service = VideoService()
-        if let info = try? await service.fetchInfo(id: videoID) {
-            if let hls = info.streamingURL { return hls }
-            logFormats(videoID: videoID, source: "IOS", formats: info.formats)
-            if let progressive = Self.pickProgressiveURL(from: info.formats, maxHeight: quality.heightCap ?? .max) {
-                return progressive
-            }
+        let hls = masters + hlsFormats.filter { $0.isProgressive }.compactMap { format in
+            format.url.map { StreamCandidate(url: $0, source: source, formatID: format.id, kind: .hls, height: format.height, width: format.width) }
         }
-        if let info = try? await service.fetchInfoViaTVHTML5(id: videoID) {
-            if let hls = info.streamingURL { return hls }
-            logFormats(videoID: videoID, source: "TVHTML5", formats: info.formats)
-            if let progressive = Self.pickProgressiveURL(from: info.formats, maxHeight: quality.heightCap ?? .max) {
-                return progressive
-            }
+        let mp4 = playable.filter {
+            $0.isProgressive && $0.protocolKind == .https && $0.ext.lowercased() == "mp4"
+                && ($0.vcodec?.lowercased().hasPrefix("avc1") == true || $0.vcodec?.lowercased() == "h264")
+                && ($0.acodec?.lowercased().hasPrefix("mp4a") == true || $0.acodec?.lowercased() == "aac")
         }
-        return nil
-    }
-
-    /// Dumps a one-line digest for each format so we can see what YouTube actually returned for
-    /// content where the current heuristics produced no playable URL. Strips the URL down to its
-    /// path prefix and the presence/absence of the `n=` cipher parameter — full URLs are sensitive
-    /// (time-limited signed) and would leak into logs unredacted otherwise.
-    private func logFormats(videoID: String, source: String, formats: [VideoFormat]) {
-        log.info("formats[\(source, privacy: .public)] id=\(videoID, privacy: .public) count=\(formats.count, privacy: .public)")
-        for f in formats {
-            let hasURL = f.url != nil
-            let hasN: Bool = {
-                guard let q = f.url?.query else { return false }
-                return q.contains("&n=") || q.hasPrefix("n=")
-            }()
-            let kind: String = f.containsBothTracks ? "muxed" : (f.isVideoOnly ? "videoOnly" : (f.isAudioOnly ? "audioOnly" : "?"))
-            log.info("  itag=\(f.id, privacy: .public) kind=\(kind, privacy: .public) h=\(f.height ?? -1, privacy: .public) mime=\(f.mimeType, privacy: .public) hasURL=\(hasURL, privacy: .public) hasN=\(hasN, privacy: .public)")
+        .compactMap { format in
+            format.url.map { StreamCandidate(url: $0, source: source, formatID: format.id, kind: .mp4, height: format.height, width: format.width) }
         }
-    }
-
-    /// Picks the highest-quality progressive (audio+video muxed) format within the user's
-    /// quality ceiling. AVPlayer can play these directly via `AVPlayerItem(url:)`; the audio-only
-    /// and video-only adaptive streams would need an AVMutableComposition setup, which we skip
-    /// here on purpose — this is the streaming-fallback path, not a full DASH player.
-    private static func pickProgressiveURL(from formats: [VideoFormat], maxHeight: Int) -> URL? {
-        formats
-            .filter { $0.containsBothTracks && $0.url != nil }
-            .filter { ($0.height ?? .max) <= maxHeight }
-            .sorted { ($0.height ?? 0) > ($1.height ?? 0) }
-            .first?
-            .url
+        return hls + mp4
     }
 
     /// Fetches `MoreVideoInfosResponse` for the current video and appends the recommended videos to
     /// the queue. This is what makes the player behave like the YouTube app: tap any video and a
     /// fresh "up next" queue is ready to advance when the current track ends.
     private func fillQueueWithRecommendations(for seed: Video) async {
+        guard let currentVideoID = currentVideo?.id else { return }
         do {
             let info = try await VideoService().fetchMoreInfo(id: seed.id)
+            guard !Task.isCancelled, currentVideo?.id == currentVideoID else { return }
             // Only append recommendations that aren't already queued, preserving the user's own
             // ordering if they came from a "Play all" playlist load.
             let existingIDs = Set(queue.items.map(\.id))
@@ -555,6 +933,7 @@ final class PlayerStateManager {
         let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self else { return }
+            MainActor.assumeIsolated { self.sampleWatchHistory(at: time.seconds) }
             Task { @MainActor in
                 self.elapsed = time.seconds.isFinite ? time.seconds : 0
                 if let item = self.player.currentItem {
@@ -565,13 +944,30 @@ final class PlayerStateManager {
             }
         }
 
-        // Auto-advance on item end.
-        endObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
+        watchHistoryTimeJumpObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.timeJumpedNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            guard let item = notification.object as? AVPlayerItem else { return }
+            MainActor.assumeIsolated {
+                guard let self, self.watchHistoryPlayback?.item === item else { return }
+                self.watchHistoryPlayback?.lastSample = nil
+            }
+        }
+
+        // Auto-advance on item end.
+        endObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
             guard let self else { return }
+            if let item = notification.object as? AVPlayerItem {
+                MainActor.assumeIsolated {
+                    if self.watchHistoryPlayback?.item === item { self.watchHistoryPlayback = nil }
+                }
+            }
             Task { @MainActor in
                 if self.preferences.autoplayNext { self.playNext() }
             }
@@ -602,14 +998,24 @@ final class PlayerStateManager {
         timeControlStatusObservation = player.observe(\.timeControlStatus, options: [.new, .initial]) { [weak self] avPlayer, _ in
             guard let self else { return }
             let status = avPlayer.timeControlStatus
+            let playingItem = status == .playing ? avPlayer.currentItem : nil
             Task { @MainActor in
                 switch status {
                 case .playing:
+                    // The callback may reach the main actor after a different video was selected.
+                    if self.shouldRecordWatchHistory,
+                       let playingItem,
+                       playingItem === self.player.currentItem,
+                       let video = self.currentVideo {
+                        self.shouldRecordWatchHistory = false
+                        self.recordWatchHistory(video: video, item: playingItem)
+                    }
                     if !self.isPlaying {
                         self.log.info("KVO timeControlStatus → playing (sync isPlaying=true)")
                         self.isPlaying = true
                     }
                 case .paused:
+                    if self.player.timeControlStatus == .paused { self.watchHistoryPlayback?.lastSample = nil }
                     if self.isPlaying {
                         self.log.info("KVO timeControlStatus → paused (sync isPlaying=false)")
                         self.isPlaying = false

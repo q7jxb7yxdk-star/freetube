@@ -2,6 +2,7 @@ import Foundation
 
 enum VideoQuality: String, CaseIterable, Identifiable, Sendable {
     case auto
+    case highest
     case p144 = "144p"
     case p240 = "240p"
     case p360 = "360p"
@@ -17,6 +18,7 @@ enum VideoQuality: String, CaseIterable, Identifiable, Sendable {
     var heightCap: Int? {
         switch self {
         case .auto: return 1080
+        case .highest: return nil
         case .p144: return 144
         case .p240: return 240
         case .p360: return 360

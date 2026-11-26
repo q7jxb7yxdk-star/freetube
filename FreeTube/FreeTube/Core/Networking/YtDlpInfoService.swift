@@ -17,14 +17,14 @@ import PythonKit
 final class YtDlpInfoService: Sendable {
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "YtDlpInfoService")
 
-    func probe(url: String) async throws -> RemoteMedia {
+    func probe(url: String, useVisionOSClient: Bool = false) async throws -> RemoteMedia {
         log.info("[probe] start url=\(url, privacy: .public)")
         let startedAt = Date()
         do {
             log.info("[probe] calling PythonRunner.runIsolated…")
             let media = try await PythonRunner.shared.runIsolated { [log] () -> RemoteMedia in
                 log.info("[probe] inside runIsolated; calling freetube_yt_dlp_extract_info")
-                let info = try freetube_yt_dlp_extract_info(url: url)
+                let info = try freetube_yt_dlp_extract_info(url: url, useVisionOSClient: useVisionOSClient)
                 log.info("[probe] freetube_yt_dlp_extract_info returned; converting to RemoteMedia")
                 // For playlists yt-dlp returns `_type=playlist` with an `entries` array.
                 // v1 treats playlists as "pick the first entry" because the UI doesn't render
@@ -130,6 +130,7 @@ final class YtDlpInfoService: Sendable {
         guard !id.isEmpty else { return nil }
 
         let urlStr = fmt.checking["url"].flatMap(String.init) ?? ""
+        let manifestURL = fmt.checking["manifest_url"].flatMap(String.init).flatMap { URL(string: $0) }
         let ext = fmt.checking["ext"].flatMap(String.init) ?? ""
 
         // yt-dlp uses the literal string "none" for absent codecs (audio-only formats have
@@ -168,6 +169,9 @@ final class YtDlpInfoService: Sendable {
         return RemoteFormat(
             id: id,
             url: URL(string: urlStr),
+            manifestURL: manifestURL,
+            isHLSAudioRendition: protocolKind == .hls && manifestURL != nil
+                && vcodecRaw == "none" && acodecRaw != "none",
             ext: ext,
             width: widthRaw > 0 ? widthRaw : nil,
             height: heightRaw > 0 ? heightRaw : nil,

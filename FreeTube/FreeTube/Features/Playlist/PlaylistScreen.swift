@@ -405,10 +405,9 @@ struct PlaylistScreen: View {
     /// after the previous finished, so the UI made it look like the Download All button was
     /// downloading one track and ignoring the rest.
     private func enqueueAllDownloads(_ videos: [Video]) {
-        let quality = UserPreferences().preferredQuality
         for video in videos {
             Task {
-                _ = try? await DownloadManager.shared.ensureDownloaded(video: video, quality: quality)
+                _ = try? await DownloadManager.shared.ensureDownloaded(video: video)
             }
         }
     }

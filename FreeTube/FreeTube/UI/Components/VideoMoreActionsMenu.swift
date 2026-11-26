@@ -11,6 +11,7 @@ import OSLog
 /// Auth-gating rules (per product spec):
 ///   - Open in browser, Copy URL: always shown
 ///   - Open in… : shown only when the video has a local downloaded file
+///   - Download: shown when the video has no local downloaded file
 ///   - Add to favorites / Remove from favorites: shown only when signed in
 ///   - Add to playlist: shown only when signed in
 ///   - Remove downloaded file: shown only when the video has a local downloaded file
@@ -23,6 +24,7 @@ struct VideoMoreActionsMenu: View {
 
     @State private var shareFileURL: URL?
     @State private var addToPlaylistVideo: Video?
+    @State private var downloadError: ErrorState?
 
     var body: some View {
         Menu {
@@ -49,21 +51,32 @@ struct VideoMoreActionsMenu: View {
         .sheet(item: $addToPlaylistVideo) { video in
             AddToPlaylistSheet(videoID: video.id, videoTitle: video.title)
         }
+        .alert("Download", isPresented: Binding(
+            get: { downloadError != nil },
+            set: { if !$0 { downloadError = nil } }
+        ), presenting: downloadError) { _ in
+            Button("OK", role: .cancel) {}
+        } message: { error in
+            Text(error.message)
+        }
     }
 
     @ViewBuilder
     private var menuContent: some View {
+        let localFile = DownloadManager.shared.localFile(for: video.id)
         Button {
             if let url = watchURL { UIApplication.shared.open(url) }
         } label: {
             Label("Open in browser", systemImage: "safari")
         }
-        if let localFile = DownloadManager.shared.localFile(for: video.id) {
+        if let localFile {
             Button {
                 shareFileURL = localFile
             } label: {
                 Label("Open in…", systemImage: "square.and.arrow.up")
             }
+        } else {
+            VideoDownloadMenuButton(video: video) { downloadError = $0 }
         }
         Button {
             if let url = watchURL { UIPasteboard.general.string = url.absoluteString }
@@ -87,7 +100,7 @@ struct VideoMoreActionsMenu: View {
                 Label("Add to playlist", systemImage: "text.badge.plus")
             }
         }
-        if DownloadManager.shared.localFile(for: video.id) != nil {
+        if localFile != nil {
             Divider()
             Button(role: .destructive) {
                 DownloadManager.shared.deleteDownloaded(videoID: video.id, context: modelContext)
@@ -146,5 +159,34 @@ struct VideoMoreActionsMenu: View {
                 }
             }
         }
+    }
+}
+
+@available(iOS 17.0, *)
+struct VideoDownloadMenuButton: View {
+    let video: Video
+    let onError: (ErrorState) -> Void
+
+    var body: some View {
+        let downloads = DownloadManager.shared
+        let isDownloading = downloads.isDownloading(videoID: video.id)
+        Button {
+            Task {
+                do {
+                    _ = try await downloads.ensureDownloaded(video: video, priority: .userInitiated)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    onError(ErrorState(from: error))
+                }
+            }
+        } label: {
+            if isDownloading {
+                Label("Downloading · see Downloads tab", systemImage: "arrow.down.circle")
+            } else {
+                Label("Download", systemImage: "arrow.down.circle")
+            }
+        }
+        .disabled(isDownloading)
     }
 }

@@ -195,35 +195,29 @@ final class FetchViewModel {
         probeTask = task
     }
 
-    /// Picks the best video + best audio as the initial selection whenever a fresh probe
-    /// lands. Tries to deliver "muxed mp4 that AVPlayer can actually decode" by default:
-    ///   - Video: prefer H.264 over VP9/AV1, then best resolution, then best fps. Apple's
-    ///     `AVPlayer` decodes VP9-in-MP4 unreliably across macOS / iOS versions — Instagram
-    ///     in particular serves VP9 reels which play as audio-only on many systems. H.264
-    ///     is the universal-compatibility default.
-    ///   - Audio: best audio-only when the chosen video is video-only; nil when the chosen
-    ///     video already has audio embedded (progressive) so we don't try to mux an
-    ///     unrelated audio track over a self-contained file.
+    /// Preselects the highest resolution within the current network's quality limit. The
+    /// picker remains available for manually selecting any of the source's formats.
     private func applyDefaults(for media: RemoteMedia) {
         let usable = media.formats.filter { $0.url != nil && $0.protocolKind != .unsupported }
-        let videoOnly = usable.filter { $0.isVideoOnly }
-        let progressive = usable.filter { $0.isProgressive }
-        let audioOnly = usable.filter { $0.isAudioOnly }
+        let videos = usable.filter { $0.hasVideo }
+        let cap = DownloadManager.shared.currentDownloadQuality.heightCap
+        let eligibleVideos = videos.filter { format in
+            guard let cap else { return true }
+            return (format.height ?? .max) <= cap
+        }
 
-        let bestVideoOnly = videoOnly.max(by: Self.videoRank)
-        let bestProgressive = progressive.max(by: Self.videoRank)
-        let bestAudioOnly = audioOnly.max { ($0.abr ?? 0) < ($1.abr ?? 0) }
+        let video = eligibleVideos.max { lhs, rhs in
+            let lhsHeight = lhs.height ?? 0
+            let rhsHeight = rhs.height ?? 0
+            if lhsHeight != rhsHeight { return lhsHeight < rhsHeight }
+            return Self.videoRank(lhs, rhs)
+        }
 
-        if let v = bestVideoOnly {
-            selectedVideoFormat = v
-            selectedAudioFormat = bestAudioOnly
-        } else if let p = bestProgressive {
-            selectedVideoFormat = p
-            selectedAudioFormat = nil // audio already embedded
+        selectedVideoFormat = video
+        if video?.isVideoOnly == true || videos.isEmpty {
+            selectedAudioFormat = usable.filter { $0.isAudioOnly }.max { ($0.abr ?? 0) < ($1.abr ?? 0) }
         } else {
-            // Audio-only source (SoundCloud, podcast, etc.).
-            selectedVideoFormat = nil
-            selectedAudioFormat = bestAudioOnly
+            selectedAudioFormat = nil
         }
         recomputeConversionDefaults()
     }

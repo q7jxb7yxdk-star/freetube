@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import OSLog
+import UniformTypeIdentifiers
 
 /// `AVAssetResourceLoaderDelegate` that proxies every HLS request (manifest + variant playlists +
 /// every .ts/.mp4 segment) through a `URLSession` we control, so we can attach a consistent
@@ -215,5 +216,210 @@ final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate {
         }
         result.append(String(remainder))
         return result
+    }
+}
+
+/// A snapshot of the master playlist, with enough information to construct an exact-resolution asset.
+nonisolated struct HLSResolutionPlaylist: Sendable {
+    private struct Entry: Sendable {
+        let text: String
+        let resolution: Int?
+    }
+
+    private let entries: [Entry]
+    private let query: String?
+    let resolutions: [Int]
+
+    static func load(from url: URL) async throws -> HLSResolutionPlaylist {
+        guard url.scheme?.lowercased() == "https" else { throw URLError(.unsupportedURL) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 3
+        configuration.timeoutIntervalForResource = 4
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        let (data, response) = try await session.data(from: url)
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let baseURL = http.url, baseURL.scheme?.lowercased() == "https" else {
+            throw URLError(.badServerResponse)
+        }
+        guard let manifest = String(data: data, encoding: .utf8) else {
+            throw URLError(.cannotParseResponse)
+        }
+        return try HLSResolutionPlaylist(manifest: manifest, baseURL: baseURL)
+    }
+
+    @MainActor
+    func makePlayback(resolution: Int) -> (asset: AVURLAsset, loader: HLSResolutionResourceLoader)? {
+        guard resolutions.contains(resolution) else { return nil }
+        let lines = entries.compactMap { entry in
+            entry.resolution == nil || entry.resolution == resolution ? entry.text : nil
+        }
+        var urlString = "freetubehlsresolution://playlist/\(UUID().uuidString)/master.m3u8"
+        // QUERYPARAM definitions in the master must also work for IMPORT tags in child playlists.
+        if let query { urlString += "?" + query }
+        guard let url = URL(string: urlString, encodingInvalidCharacters: false) else { return nil }
+        let data = Data((lines.joined(separator: "\n") + "\n").utf8)
+        let loader = HLSResolutionResourceLoader(url: url, data: data)
+        let asset = AVURLAsset(url: url)
+        asset.resourceLoader.setDelegate(loader, queue: .main)
+        return (asset, loader)
+    }
+
+    private init(manifest: String, baseURL: URL) throws {
+        let lines = manifest.split(whereSeparator: \.isNewline)
+        guard lines.first == "#EXTM3U" else { throw URLError(.cannotParseResponse) }
+
+        let baseComponents = URLComponents(url: baseURL, resolvingAgainstBaseURL: true)
+        var usesQuery = false
+        var variables: [String: String] = [:]
+        var found: Set<Int> = []
+        var parsed: [Entry] = []
+        var pendingVariant: (tag: String, resolution: Int?)?
+
+        for rawLine in lines {
+            var line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+
+            if !line.hasPrefix("#") {
+                guard let variant = pendingVariant else { throw URLError(.cannotParseResponse) }
+                pendingVariant = nil
+                guard let resolution = variant.resolution else { continue }
+                let uri = try Self.resolveURI(line, against: baseURL, variables: variables)
+                guard let url = URL(string: uri, encodingInvalidCharacters: false),
+                      url.scheme?.lowercased() == "https", url.host != nil else { continue }
+                found.insert(resolution)
+                parsed.append(Entry(text: variant.tag + "\n" + uri, resolution: resolution))
+                continue
+            }
+
+            let tag = line.prefix { $0 != ":" }
+            let attributes = Self.attributes(in: line)
+            switch tag {
+            case "#EXT-X-STREAM-INF":
+                guard pendingVariant == nil else { throw URLError(.cannotParseResponse) }
+                pendingVariant = (line, Self.resolution(from: attributes["RESOLUTION"]))
+                continue
+            case "#EXT-X-CONTENT-STEERING":
+                // A steering manifest can replace signed variant and rendition URLs.
+                continue
+            case "#EXT-X-DEFINE":
+                if let parameter = attributes["QUERYPARAM"] {
+                    guard let value = baseComponents?.queryItems?.first(where: { $0.name == parameter })?.value else {
+                        throw URLError(.cannotParseResponse)
+                    }
+                    variables[String(parameter)] = value
+                    usesQuery = true
+                } else if let name = attributes["NAME"], let value = attributes["VALUE"] {
+                    variables[String(name)] = try Self.expandVariables(in: String(value), using: variables)
+                }
+            default:
+                break
+            }
+
+            let resolution: Int?
+            if tag == "#EXT-X-I-FRAME-STREAM-INF" {
+                guard let size = Self.resolution(from: attributes["RESOLUTION"]) else { continue }
+                resolution = size
+            } else {
+                resolution = nil
+            }
+            if let uri = attributes["URI"] {
+                let absoluteURI = try Self.resolveURI(String(uri), against: baseURL, variables: variables)
+                line.replaceSubrange(uri.startIndex..<uri.endIndex, with: absoluteURI)
+            }
+            parsed.append(Entry(text: line, resolution: resolution))
+        }
+
+        guard pendingVariant == nil, !found.isEmpty else { throw URLError(.cannotParseResponse) }
+        resolutions = found.sorted(by: >)
+        entries = parsed
+        query = usesQuery ? baseComponents?.percentEncodedQuery : nil
+    }
+
+    private static func attributes(in line: String) -> [Substring: Substring] {
+        guard line.hasPrefix("#EXT-X-"), let colon = line.firstIndex(of: ":") else { return [:] }
+        let list = line[line.index(after: colon)...]
+        var attributes: [Substring: Substring] = [:]
+        // Quoted values can contain commas, including codec lists, names, and signed URLs.
+        for match in list.matches(of: #/(?:^|,)([A-Z0-9-]+)=(?:"([^"]*)"|([^,]+))/#) {
+            attributes[match.1] = match.2 ?? match.3
+        }
+        return attributes
+    }
+
+    private static func resolution(from dimensions: Substring?) -> Int? {
+        guard let parts = dimensions?.split(separator: "x", omittingEmptySubsequences: false),
+              parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]),
+              width > 0, height > 0 else { return nil }
+        return min(width, height)
+    }
+
+    private static func expandVariables(in value: String, using variables: [String: String]) throws -> String {
+        var expanded = value
+        for match in value.matches(of: #/\{\$([a-zA-Z0-9_-]+)\}/#).reversed() {
+            guard let replacement = variables[String(match.1)] else { throw URLError(.cannotParseResponse) }
+            expanded.replaceSubrange(match.range, with: replacement)
+        }
+        return expanded
+    }
+
+    private static func resolveURI(_ uri: String, against baseURL: URL, variables: [String: String]) throws -> String {
+        let expanded = try expandVariables(in: uri, using: variables)
+        guard !expanded.isEmpty, let reference = URL(string: expanded, encodingInvalidCharacters: false) else {
+            throw URLError(.badURL)
+        }
+        // Preserve the original spelling and percent escapes of signed absolute URLs.
+        if reference.scheme != nil { return expanded }
+        guard let resolved = URL(string: expanded, relativeTo: baseURL)?.absoluteURL else {
+            throw URLError(.badURL)
+        }
+        return resolved.absoluteString
+    }
+}
+
+/// Serves one in-memory master. AVPlayer loads the referenced HTTPS playlists and media directly.
+nonisolated final class HLSResolutionResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+    private let url: URL
+    private let data: Data
+
+    fileprivate init(url: URL, data: Data) {
+        self.url = url
+        self.data = data
+        super.init()
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        guard loadingRequest.request.url == url else { return false }
+
+        if let content = loadingRequest.contentInformationRequest {
+            let contentType = UTType.m3uPlaylist.identifier
+            if content.allowedContentTypes?.contains(contentType) != false {
+                content.contentType = contentType
+            }
+            content.contentLength = Int64(data.count)
+            content.isByteRangeAccessSupported = true
+        }
+        if let request = loadingRequest.dataRequest {
+            let requestedOffset = request.requestedOffset
+            let offset = max(request.currentOffset, requestedOffset)
+            guard requestedOffset >= 0, let start = Int(exactly: offset), start <= data.count else {
+                loadingRequest.finishLoading(with: URLError(.badServerResponse))
+                return true
+            }
+            let available = data.count - start
+            let length = request.requestsAllDataToEndOfResource
+                ? available
+                : min(max(0, request.requestedLength - (start - Int(requestedOffset))), available)
+            if length > 0 {
+                request.respond(with: data.subdata(in: start..<(start + length)))
+            }
+        }
+        loadingRequest.finishLoading()
+        return true
     }
 }

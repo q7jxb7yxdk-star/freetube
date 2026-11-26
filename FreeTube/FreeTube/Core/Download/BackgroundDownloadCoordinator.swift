@@ -45,18 +45,21 @@ final class BackgroundDownloadCoordinator: NSObject {
         ) { [weak self] task in
             self?.handle(task: task as? BGProcessingTask)
         }
-        scheduleNextBackgroundTask()
+        _ = scheduleNextBackgroundTask()
     }
 
-    func scheduleNextBackgroundTask() {
-        let request = BGProcessingTaskRequest(identifier: Self.bgTaskIdentifier)
-        request.requiresNetworkConnectivity = true
-        request.requiresExternalPower = false
-        do {
-            try BGTaskScheduler.shared.submit(request)
-            log.info("Scheduled BG processing task")
-        } catch {
-            log.error("Failed to schedule BG task: \(String(describing: error), privacy: .public)")
+    private func scheduleNextBackgroundTask() -> Task<Void, Never> {
+        let identifier = Self.bgTaskIdentifier
+        return Task.detached(priority: .utility) { [log] in
+            let request = BGProcessingTaskRequest(identifier: identifier)
+            request.requiresNetworkConnectivity = true
+            request.requiresExternalPower = false
+            do {
+                try await BGTaskScheduler.shared.submitTaskRequest(request)
+                log.info("Scheduled BG processing task")
+            } catch {
+                log.error("Failed to schedule BG task: \(String(describing: error), privacy: .public)")
+            }
         }
     }
 
@@ -66,8 +69,11 @@ final class BackgroundDownloadCoordinator: NSObject {
         task.expirationHandler = {
             // No-op: URLSession background downloads continue independently of the BG task lifecycle.
         }
-        scheduleNextBackgroundTask()
-        task.setTaskCompleted(success: true)
+        let submission = scheduleNextBackgroundTask()
+        Task {
+            await submission.value
+            task.setTaskCompleted(success: true)
+        }
     }
 
     func setBackgroundEventsCompletionHandler(_ handler: @escaping () -> Void, identifier: String) {

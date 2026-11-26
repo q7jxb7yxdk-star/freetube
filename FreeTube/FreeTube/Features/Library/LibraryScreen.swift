@@ -2,17 +2,13 @@ import SwiftUI
 import SwiftData
 import Kingfisher
 
-/// Library is the user's home for everything tied to their YouTube account. When signed in we
-/// render the account header followed by a menu of six destinations:
-///   - Watch history (`HistoryScreen` backed by `HistoryResponse`)
+/// Library always offers on-device watch history. When signed in, History also shows the account's
+/// watch history, and Library offers these additional destinations:
 ///   - Playlists (list of user-owned playlists from `AccountLibraryResponse`)
 ///   - Your videos (the user's own uploads — opens `ChannelScreen(channelID:)`)
 ///   - Subscriptions (channels you follow — opens `SubscriptionsScreen`)
 ///   - Liked videos (special playlist `VLLL` — opens `PlaylistScreen`)
 ///   - Watch later (special playlist `VLWL` — opens `PlaylistScreen`)
-///
-/// When signed out we show a single sign-in CTA and hide the menu. Tapping any item while
-/// signed out would route to an error toast — clearer to just gate the whole menu.
 @available(iOS 17.0, *)
 struct LibraryScreen: View {
     @State private var libraryModel = LibraryViewModel()
@@ -23,6 +19,13 @@ struct LibraryScreen: View {
         NavigationStack {
             List {
                 accountSection
+                Section {
+                    NavigationLink {
+                        HistoryScreen(showsYouTubeHistory: accountModel.info != nil)
+                    } label: {
+                        Label("Watch history", systemImage: "clock.fill")
+                    }
+                }
                 if accountModel.info != nil {
                     menuSection
                 }
@@ -91,7 +94,7 @@ struct LibraryScreen: View {
             }
         } footer: {
             if accountModel.info == nil {
-                Text("Sign in to access your watch history, playlists, liked videos, and Watch Later.")
+                Text("Sign in to access your YouTube history, playlists, liked videos, and Watch Later.")
             }
         }
     }
@@ -105,14 +108,6 @@ struct LibraryScreen: View {
     @ViewBuilder
     private var menuSection: some View {
         Section {
-            menuRow(
-                title: "Watch history",
-                subtitle: countSubtitle(libraryModel.library?.historyCount, noun: "video"),
-                systemImage: "clock.fill"
-            ) {
-                HistoryScreen()
-            }
-
             menuRow(
                 title: "Playlists",
                 subtitle: countSubtitle(libraryModel.library?.playlists.count, noun: "playlist"),

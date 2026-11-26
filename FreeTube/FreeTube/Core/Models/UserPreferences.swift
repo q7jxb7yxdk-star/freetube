@@ -4,30 +4,15 @@ import SwiftUI
 /// Lightweight user preferences stored in `UserDefaults` via `@AppStorage`. Use this for primitive flags only;
 /// anything queryable belongs in SwiftData.
 struct UserPreferences {
-    /// Default to 360p on a fresh install — it's the only YouTube format that ships as a single
-    /// combined progressive mp4 (itag 18), so downloads complete fast and skip the Swift-side
-    /// ffmpeg mux step. Users can bump it higher in Settings.
-    @AppStorage("preferredQuality") var preferredQualityRaw: String = VideoQuality.p360.rawValue
-    @AppStorage("alwaysDownloadBeforePlayback") var alwaysDownloadBeforePlayback: Bool = false
-    /// When `true`, downloads (and playback-time fetches, since those use the same path) are
-    /// allowed to run over cellular. Default is `true` — permissive — so a fresh install
-    /// works out of the box on a phone without Wi-Fi. Users who pay per MB can disable this
-    /// and the network gate in `DownloadManager.waitForAllowedNetwork` will throw until
-    /// Wi-Fi comes back. Was previously stored under the `wifiOnlyDownloads` key with the
-    /// opposite meaning (true = blocked on cellular); fresh key here so the default flips
-    /// cleanly for existing installs.
+    /// Allows explicit YouTube downloads when Wi-Fi is unavailable.
     @AppStorage("allowCellularDownloads") var allowCellularDownloads: Bool = true
     @AppStorage("autoplayNext") var autoplayNext: Bool = true
+    @AppStorage("syncYouTubeWatchHistory") var syncYouTubeWatchHistory: Bool = false
     /// When true, `LogFileWriter` opens a new file under `Documents/Logs/` on every app
     /// launch and mirrors the unified-log entries for our subsystem into it. Useful for
     /// capturing diagnostic traces from TestFlight / sideload installs where Console.app
     /// access isn't practical. Defaults off — only a handful of users will ever flip this.
     @AppStorage("logToFile") var logToFile: Bool = false
-    /// When true (default), `PlayerStateManager` kicks off a background download of the
-    /// next queue item right after the current video starts playing — so Next-tap is
-    /// instant. Users who want to save bandwidth (or who tend not to advance through the
-    /// queue) can flip this off in Settings.
-    @AppStorage("prefetchNextInQueue") var prefetchNextInQueue: Bool = true
     @AppStorage("restrictedSearchMode") var restrictedSearchMode: Bool = false
     @AppStorage("appearanceMode") var appearanceModeRaw: String = AppearanceMode.system.rawValue
     @AppStorage("downloadCacheLimit") var downloadCacheLimitRaw: String = DownloadCacheLimit.unlimited.rawValue
@@ -58,9 +43,20 @@ struct UserPreferences {
     /// and (c) keeping it in `UserDefaults` matches the rest of this struct's conventions.
     @AppStorage("recentFetchURLs") var recentFetchURLsJSON: String = "[]"
 
-    var preferredQuality: VideoQuality {
-        get { VideoQuality(rawValue: preferredQualityRaw) ?? .auto }
-        nonmutating set { preferredQualityRaw = newValue.rawValue }
+    var wifiDownloadQuality: VideoQuality {
+        get {
+            UserDefaults.standard.string(forKey: "wifiDownloadQuality")
+                .flatMap(VideoQuality.init(rawValue:)) ?? .highest
+        }
+        nonmutating set { UserDefaults.standard.set(newValue.rawValue, forKey: "wifiDownloadQuality") }
+    }
+
+    var cellularDownloadQuality: VideoQuality {
+        get {
+            UserDefaults.standard.string(forKey: "cellularDownloadQuality")
+                .flatMap(VideoQuality.init(rawValue:)) ?? .p720
+        }
+        nonmutating set { UserDefaults.standard.set(newValue.rawValue, forKey: "cellularDownloadQuality") }
     }
 
     var appearanceMode: AppearanceMode {

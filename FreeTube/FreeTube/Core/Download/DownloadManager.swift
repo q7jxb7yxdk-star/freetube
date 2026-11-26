@@ -53,6 +53,8 @@ actor PythonRunner {
                     let result = try EmbeddedPython.withInterpreter(moduleURL: moduleURL) {
                         do {
                             return try work()
+                        } catch let error as YtDlpDownloadError {
+                            throw error
                         } catch {
                             // PythonKit errors may own Python objects. Format and release
                             // them before the interpreter lock is released.
@@ -139,7 +141,7 @@ actor FFmpegRunner {
 /// can render a live transfer queue.
 ///
 /// **Playback contract (CLAUDE.md §7 amended):**
-/// Every play tap calls `ensureDownloaded(video:quality:)`. If `Documents/<id>.mp4` already
+/// Every download request calls `ensureDownloaded`. If `Documents/<id>.mp4` already
 /// exists, we return immediately. Otherwise we kick off a yt-dlp run (via `PythonRunner`),
 /// wait for it, write a `DownloadMetadata` xattr to the resulting file, and hand the local URL back to the resolver. This
 /// sidesteps every PoT/cookie/HLS edge case in YouTube's CDN — the bytes are on disk before
@@ -159,8 +161,7 @@ final class DownloadManager: TemporaryDownloading {
     /// is why the Downloads tab looked empty while the badge was incrementing.
     private(set) var activeTasks: [DownloadTaskSnapshot] = []
 
-    /// Per-video downloaded progress (0…1). The player observes this so the mini-player and the
-    /// full-screen player can render a progress overlay while a file is being fetched.
+    /// Per-video downloaded progress (0…1).
     private(set) var progressByVideoID: [String: Double] = [:]
     /// Per-video human-readable phase label ("video", "audio", "muxing"). yt-dlp downloads multiple
     /// streams sequentially under the same id, so we surface which one is currently in-flight to
@@ -194,10 +195,13 @@ final class DownloadManager: TemporaryDownloading {
 
     // MARK: - Public surface
 
-    /// Returns the local file URL for a downloaded video, or nil if it isn't on disk.
-    /// Pure filesystem check — no I/O beyond `fileExists`. Called from SwiftUI bodies, so
-    /// no logging here.
+    func isDownloading(videoID: String) -> Bool {
+        inflight[videoID] != nil
+    }
+
+    /// Returns the local file only after its download and mux have finished.
     func localFile(for videoID: String) -> URL? {
+        guard !isDownloading(videoID: videoID) else { return nil }
         let url = Self.fileURL(for: videoID)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
@@ -206,11 +210,17 @@ final class DownloadManager: TemporaryDownloading {
     /// the freshly-written path. Coalesces parallel callers for the same `videoID`.
     ///
     /// `priority` controls where the download lands in `PythonRunner`'s queue. `.userInitiated`
-    /// — the call comes from a play tap, the user is actively waiting — jumps ahead of any
-    /// pending `.background` items (playlist Download All, queue prefetch). The currently-running
+    /// jumps ahead of pending `.background` items such as playlist Download All. The currently-running
     /// yt-dlp cannot be preempted, but the new high-priority item runs immediately after it.
+    func ensureDownloaded(video: Video, priority: DownloadPriority = .background) async throws -> URL {
+        try await ensureDownloaded(video: video, quality: nil, priority: priority)
+    }
+
     func ensureDownloaded(video: Video, quality: VideoQuality, priority: DownloadPriority = .background) async throws -> URL {
-        log.info("ensureDownloaded(\(video.id, privacy: .public)) — title=\"\(video.title, privacy: .public)\" quality=\(quality.rawValue, privacy: .public) priority=\(String(describing: priority), privacy: .public)")
+        try await ensureDownloaded(video: video, quality: Optional(quality), priority: priority)
+    }
+
+    private func ensureDownloaded(video: Video, quality: VideoQuality?, priority: DownloadPriority) async throws -> URL {
         if let existing = localFile(for: video.id) {
             log.info("ensureDownloaded(\(video.id, privacy: .public)): cache hit, skipping yt-dlp")
             return existing
@@ -221,14 +231,15 @@ final class DownloadManager: TemporaryDownloading {
             return try await inflightTask.value
         }
 
-        log.info("ensureDownloaded(\(video.id, privacy: .public)): checking network gate (allowCellular=\(self.preferences.allowCellularDownloads, privacy: .public))")
-        try await waitForAllowedNetwork()
-        log.info("ensureDownloaded(\(video.id, privacy: .public)): network gate passed, spawning download task")
+        let path = currentPath ?? pathMonitor.currentPath
+        try checkAllowedNetwork(path)
+        let selectedQuality = quality ?? downloadQuality(for: path)
+        log.info("ensureDownloaded(\(video.id, privacy: .public)): quality=\(selectedQuality.rawValue, privacy: .public) priority=\(String(describing: priority), privacy: .public)")
 
         let task = Task<URL, Error> { @MainActor [weak self] in
             guard let self else { throw YouTubeServiceError.unknown(NSError(domain: "DownloadManager", code: -1)) }
             defer { self.inflight[video.id] = nil }
-            return try await self.runYoutubeDLDownload(video: video, quality: quality, priority: priority)
+            return try await self.runYoutubeDLDownload(video: video, quality: selectedQuality, priority: priority)
         }
         inflight[video.id] = task
         return try await task.value
@@ -250,16 +261,14 @@ final class DownloadManager: TemporaryDownloading {
         guard let snapshot = tasks[taskID] else { return }
         tasks[taskID] = nil
         publishSnapshots()
-        if let task = inflight[snapshot.videoID] {
-            task.cancel()
-            inflight[snapshot.videoID] = nil
-        }
+        // Keep the video reserved until the worker finishes cleaning up its files.
+        inflight[snapshot.videoID]?.cancel()
     }
 
     // MARK: - TemporaryDownloading
 
     /// Legacy path retained to satisfy the resolver protocol. The new resolver calls
-    /// `ensureDownloaded(video:quality:)` directly; this is just a thin wrapper.
+    /// `ensureDownloaded` directly; this is just a thin wrapper.
     func downloadTemporary(videoID: String, format: VideoFormat) async throws -> URL {
         let placeholder = Video(
             id: videoID,
@@ -275,7 +284,7 @@ final class DownloadManager: TemporaryDownloading {
             isLive: false,
             isShort: false
         )
-        return try await ensureDownloaded(video: placeholder, quality: preferences.preferredQuality)
+        return try await ensureDownloaded(video: placeholder)
     }
 
     // MARK: - yt-dlp execution
@@ -295,7 +304,6 @@ final class DownloadManager: TemporaryDownloading {
 
         let destination = Self.fileURL(for: video.id)
         let downloadsDir = destination.deletingLastPathComponent()
-        let stem = destination.deletingPathExtension().lastPathComponent
         log.debug("yt-dlp[\(video.id, privacy: .public)] destination=\(destination.path, privacy: .public)")
 
         // Pre-download filesystem work — creating the dir and scanning for stale siblings — runs
@@ -307,18 +315,12 @@ final class DownloadManager: TemporaryDownloading {
             } catch {
                 // Best-effort — directory probably already exists from a prior download.
             }
-            if let siblings = try? FileManager.default.contentsOfDirectory(at: downloadsDir, includingPropertiesForKeys: nil) {
-                for url in siblings where url.lastPathComponent.hasPrefix("\(stem).") {
-                    try? FileManager.default.removeItem(at: url)
-                }
-            }
         }.value
+        await removeYtDlpIntermediates(at: destination)
+        try Task.checkCancellation()
 
-        // Use `,` (download multiple formats as separate files) instead of `+` (download + merge
-        // via ffmpeg). yt-dlp's ffmpeg merger reliably hangs on iOS — once `Popen.communicate`
-        // dispatches the merger ffmpeg subprocess we never see Python return. Doing the mux ourselves
-        // via AVAssetExportSession is the robust path. We still keep a single-file fallback
-        // (`best[ext=mp4]/best`) for the rare case where YouTube serves a combined progressive file.
+        // Select the best video stream with audio. When the streams are separate, yt-dlp
+        // writes each track and Swift muxes them using the in-process FFmpeg library.
         let formatString = Self.formatString(for: quality)
         log.debug("yt-dlp[\(video.id, privacy: .public)] format selector=\(formatString, privacy: .public)")
         // Output template includes `%(format_id)s` so individual streams land at predictable paths
@@ -348,6 +350,7 @@ final class DownloadManager: TemporaryDownloading {
         let argv: [String] = [
             "https://www.youtube.com/watch?v=\(video.id)",
             "-f", formatString,
+            "--format-sort-force", "-S", "height,fps",
             "-o", outputTemplate,
             "--no-playlist",
             "--no-progress",
@@ -387,10 +390,9 @@ final class DownloadManager: TemporaryDownloading {
             // Value is user-controlled via `UserPreferences.concurrentFragments`. We clamp here
             // as a defence-in-depth — `@AppStorage` can technically be poked to any Int.
             "--concurrent-fragments", "\(max(1, min(16, preferences.concurrentFragments)))",
-            // Belt-and-braces: point yt-dlp at a nonexistent ffmpeg so even if some edge case tries
-            // to add the merger postprocessor, it fails-fast at probe time and yt-dlp skips it
-            // instead of hanging in `Popen.communicate`. Our Swift-side AVAssetExportSession mux is
-            // the canonical join step now.
+            // With no FFmpeg executable, yt-dlp saves the requested tracks individually.
+            "--compat-options", "no-direct-merge",
+            "--no-abort-on-error",
             "--ffmpeg-location", "/dev/null/no-ffmpeg"
         ]
 
@@ -463,117 +465,51 @@ final class DownloadManager: TemporaryDownloading {
                     }
                 }
             }, priority: priority == .userInitiated ? .high : .low)
+            try Task.checkCancellation()
+            try await finalizeYtDlpOutput(at: destination, videoID: video.id)
         } catch {
-            log.error("yt-dlp[\(video.id, privacy: .public)] threw: \(String(describing: error), privacy: .public)")
-            // **Don't fail yet** — try the YouTubeKit / TVHTML5_SIMPLY_EMBEDDED_PLAYER fallback
-            // before giving up. yt-dlp's no-JS-runtime path can produce "This video is not
-            // available" for entire classes of videos (kids content, PoT-gated music videos,
-            // some live recordings) where YouTubeKit's tvHtmlModel still returns playable URLs
-            // because that client profile is exempt from PoT enforcement on the video-info side.
+            let primaryError = error
+            try? FileManager.default.removeItem(at: destination)
+            await removeYtDlpIntermediates(at: destination)
+            try Task.checkCancellation()
+            log.error("yt-dlp[\(video.id, privacy: .public)] download failed: \(primaryError.localizedDescription, privacy: .private)")
+
+            var recovered = false
+            // YouTubeKit can pair higher-resolution video with separate audio. Give it a
+            // chance before restricting the fallback to combined MP4 files.
             do {
                 try await runYouTubeKitFallback(video: video, quality: quality, destination: destination, snapshotID: snapshotID)
-                let dur = Date().timeIntervalSince(startedAt)
-                log.info("yt-dlp[\(video.id, privacy: .public)] FALLBACK SUCCESS in \(String(format: "%.1f", dur), privacy: .public)s")
-                await persistDownloaded(video: video, fileURL: destination)
+                recovered = true
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+                try Task.checkCancellation()
+                log.error("[fallback] YouTubeKit download failed for \(video.id, privacy: .public): \(error.localizedDescription, privacy: .private)")
+            }
+
+            if !recovered, (primaryError as? YtDlpDownloadError)?.httpStatus == 403, quality != .audioOnly {
+                do {
+                    try await runProbedMP4Fallback(video: video, quality: quality, destination: destination, snapshotID: snapshotID)
+                    recovered = true
+                } catch {
+                    try Task.checkCancellation()
+                    log.notice("[fallback] probed MP4 download failed for \(video.id, privacy: .public): \(error.localizedDescription, privacy: .private)")
+                }
+            }
+
+            if !recovered {
                 publish(snapshot: DownloadTaskSnapshot(
                     id: snapshotID, videoID: video.id, title: video.title,
-                    state: .completed(destination), createdAt: .now
+                    state: .failed(primaryError.localizedDescription), createdAt: .now
                 ))
-                Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    self.tasks[snapshotID] = nil
-                    self.publishSnapshots()
-                }
-                return destination
-            } catch {
-                log.error("yt-dlp[\(video.id, privacy: .public)] YouTubeKit fallback also failed: \(String(describing: error), privacy: .public)")
-                publish(snapshot: DownloadTaskSnapshot(
-                    id: snapshotID,
-                    videoID: video.id,
-                    title: video.title,
-                    state: .failed(error.localizedDescription),
-                    createdAt: .now
-                ))
-                throw YouTubeServiceError.streamExtractionFailed
+                throw primaryError
             }
         }
 
-        let elapsed = Date().timeIntervalSince(startedAt)
-        log.info("yt-dlp[\(video.id, privacy: .public)] returned after \(String(format: "%.1f", elapsed), privacy: .public)s — locating output files")
-
-        // yt-dlp wrote individual streams to <id>.<format_id>.<ext> (e.g. wh4YepmEtZk.135.mp4 +
-        // wh4YepmEtZk.140.m4a). Run the candidate scan off-main since `contentsOfDirectory` on a
-        // Downloads folder with hundreds of files becomes a noticeable hitch.
-        let intermediates: [URL] = await Task.detached(priority: .utility) {
-            let candidates = (try? FileManager.default.contentsOfDirectory(at: downloadsDir, includingPropertiesForKeys: nil))?
-                .filter { $0.lastPathComponent.hasPrefix("\(stem).") } ?? []
-            // Don't include the canonical destination itself in mux inputs.
-            return candidates.filter { $0.path != destination.path }
-        }.value
-        log.debug("yt-dlp[\(video.id, privacy: .public)] candidate files: \(intermediates.map(\.lastPathComponent).joined(separator: ", "), privacy: .public)")
-
-        let videoFile = intermediates.first { url in
-            ["mp4", "webm", "mkv"].contains(url.pathExtension.lowercased()) &&
-            !url.lastPathComponent.contains(".\(stem).m4a") &&
-            url.pathExtension.lowercased() != "m4a"
-        }
-        let audioFile = intermediates.first { ["m4a", "mp3", "aac", "opus"].contains($0.pathExtension.lowercased()) }
-
-        if let videoFile, let audioFile {
-            log.info("yt-dlp[\(video.id, privacy: .public)] muxing video=\(videoFile.lastPathComponent, privacy: .public) audio=\(audioFile.lastPathComponent, privacy: .public)")
-            do {
-                try await muxToDestination(video: videoFile, audio: audioFile, destination: destination)
-            } catch {
-                log.error("yt-dlp[\(video.id, privacy: .public)] Swift-side mux failed: \(String(describing: error), privacy: .public)")
-                publish(snapshot: DownloadTaskSnapshot(
-                    id: snapshotID,
-                    videoID: video.id,
-                    title: video.title,
-                    state: .failed("Could not combine video + audio"),
-                    createdAt: .now
-                ))
-                throw YouTubeServiceError.streamExtractionFailed
-            }
-            // Clean up the per-stream intermediates off-main — `removeItem` for each one is sync,
-            // and with N parallel downloads finishing back-to-back this can add up.
-            let toRemove = intermediates
-            await Task.detached(priority: .utility) {
-                for url in toRemove {
-                    try? FileManager.default.removeItem(at: url)
-                }
-            }.value
-        } else if let single = intermediates.first {
-            // Single combined progressive file — just rename it to the destination.
-            log.info("yt-dlp[\(video.id, privacy: .public)] single-file mode (no mux needed): \(single.lastPathComponent, privacy: .public)")
+        if Task.isCancelled {
             try? FileManager.default.removeItem(at: destination)
-            do {
-                try FileManager.default.moveItem(at: single, to: destination)
-            } catch {
-                log.error("yt-dlp[\(video.id, privacy: .public)] could not move \(single.path, privacy: .public) → destination: \(String(describing: error), privacy: .public)")
-                throw YouTubeServiceError.streamExtractionFailed
-            }
+            throw CancellationError()
         }
-
-        if !FileManager.default.fileExists(atPath: destination.path) {
-            log.notice("yt-dlp[\(video.id, privacy: .public)] post-mux: destination still missing — falling back to YouTubeKit/TVHTML5")
-            // Mirror the catch-branch fallback for the "yt-dlp returned without writing"
-            // case. Same TVHTML5_SIMPLY_EMBEDDED_PLAYER path — bypasses PoT for video-info,
-            // then downloads via plain URLSession.
-            do {
-                try await runYouTubeKitFallback(video: video, quality: quality, destination: destination, snapshotID: snapshotID)
-            } catch {
-                log.error("yt-dlp[\(video.id, privacy: .public)] YouTubeKit fallback also failed: \(String(describing: error), privacy: .public)")
-                publish(snapshot: DownloadTaskSnapshot(
-                    id: snapshotID,
-                    videoID: video.id,
-                    title: video.title,
-                    state: .failed("Download finished but file not found"),
-                    createdAt: .now
-                ))
-                throw YouTubeServiceError.streamExtractionFailed
-            }
-        }
-
+        let elapsed = Date().timeIntervalSince(startedAt)
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value ?? 0
         log.info("yt-dlp[\(video.id, privacy: .public)] file on disk: size=\(fileSize, privacy: .public) bytes path=\(destination.path, privacy: .public)")
 
@@ -599,6 +535,67 @@ final class DownloadManager: TemporaryDownloading {
         return destination
     }
 
+    private func finalizeYtDlpOutput(at destination: URL, videoID: String) async throws {
+        let downloadsDir = destination.deletingLastPathComponent()
+        let stem = destination.deletingPathExtension().lastPathComponent
+        // Split tracks use <id>.<video_id>+<audio_id>.f<track_id>.<ext>. Scan off-main
+        // since the download directory can contain hundreds of files.
+        let intermediates: [URL] = await Task.detached(priority: .utility) {
+            let candidates = (try? FileManager.default.contentsOfDirectory(at: downloadsDir, includingPropertiesForKeys: nil))?
+                .filter { $0.lastPathComponent.hasPrefix("\(stem).") } ?? []
+            // Don't include the canonical destination itself in mux inputs.
+            return candidates.filter {
+                $0.path != destination.path && !$0.pathExtension.hasPrefix("part")
+                    && $0.pathExtension != "ytdl"
+            }
+        }.value
+        log.debug("yt-dlp[\(videoID, privacy: .public)] candidate files: \(intermediates.map(\.lastPathComponent).joined(separator: ", "), privacy: .public)")
+
+        let videoFile = intermediates.first { url in
+            ["mp4", "webm", "mkv"].contains(url.pathExtension.lowercased()) &&
+            !url.lastPathComponent.contains(".\(stem).m4a") &&
+            url.pathExtension.lowercased() != "m4a"
+        }
+        let audioFile = intermediates.first { ["m4a", "mp3", "aac", "opus"].contains($0.pathExtension.lowercased()) }
+
+        if let videoFile, let audioFile {
+            log.info("yt-dlp[\(videoID, privacy: .public)] muxing video=\(videoFile.lastPathComponent, privacy: .public) audio=\(audioFile.lastPathComponent, privacy: .public)")
+            try await muxToDestination(video: videoFile, audio: audioFile, destination: destination)
+            // Clean up the per-stream intermediates off-main — `removeItem` for each one is sync,
+            // and with N parallel downloads finishing back-to-back this can add up.
+            let toRemove = intermediates
+            await Task.detached(priority: .utility) {
+                for url in toRemove {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }.value
+        } else if let single = intermediates.first, !single.lastPathComponent.contains("+") {
+            // Split track filenames include the merged format ID (video+audio).
+            // A lone split track must fall through to the YouTubeKit fallback.
+            log.info("yt-dlp[\(videoID, privacy: .public)] single-file mode (no mux needed): \(single.lastPathComponent, privacy: .public)")
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.moveItem(at: single, to: destination)
+        }
+
+        guard FileManager.default.fileExists(atPath: destination.path) else {
+            throw NSError(
+                domain: "FreeTube.DownloadManager", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "yt-dlp did not produce a complete download."]
+            )
+        }
+    }
+
+    private func removeYtDlpIntermediates(at destination: URL) async {
+        let directory = destination.deletingLastPathComponent()
+        let prefix = destination.deletingPathExtension().lastPathComponent + "."
+        await Task.detached(priority: .utility) {
+            guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
+            for file in files where file != destination && file.lastPathComponent.hasPrefix(prefix) {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }.value
+    }
+
     /// Renders a yt-dlp progress event into a snapshot and a log line. Takes Swift primitives —
     /// PythonObject extraction happens upstream on Python's GIL thread, see the progress closure in
     /// `runYoutubeDLDownload`.
@@ -613,6 +610,7 @@ final class DownloadManager: TemporaryDownloading {
         videoID: String,
         videoTitle: String
     ) {
+        guard let snapshot = tasks[snapshotID], case .downloading = snapshot.state else { return }
         let progress = total > 0 ? max(0, min(1, Double(downloaded) / Double(total))) : 0
 
         if status == "downloading" {
@@ -692,7 +690,57 @@ final class DownloadManager: TemporaryDownloading {
 
     // MARK: - YouTubeKit / TVHTML5 fallback
 
-    /// Last-resort path that runs when yt-dlp fails to produce a usable file. Uses
+    private func runProbedMP4Fallback(video: Video, quality: VideoQuality, destination: URL, snapshotID: String) async throws {
+        let watchURL = "https://www.youtube.com/watch?v=\(video.id)"
+        let media = try await YtDlpInfoService().probe(url: watchURL)
+        try Task.checkCancellation()
+        let formats = Self.probedMP4Formats(media.formats, maxHeight: quality.heightCap)
+
+        let partial = destination.deletingPathExtension().appendingPathExtension("fallback.part")
+        defer { try? FileManager.default.removeItem(at: partial) }
+        var attempted: Set<URL> = []
+        var lastError: Error = YouTubeServiceError.streamExtractionFailed
+
+        for format in formats {
+            guard attempted.count < 3 else { break }
+            guard let url = format.url, attempted.insert(url).inserted else { continue }
+            try Task.checkCancellation()
+            log.info("[fallback] Trying combined MP4 format=\(format.id, privacy: .public) height=\(format.height ?? 0, privacy: .public)")
+            publish(snapshot: DownloadTaskSnapshot(
+                id: snapshotID, videoID: video.id, title: video.title,
+                state: .downloading(progress: 0), createdAt: .now
+            ))
+            phaseByVideoID[video.id] = "stream"
+            lastProgressPublishedAt.removeValue(forKey: video.id)
+            do {
+                try await downloadStream(
+                    from: url, to: partial, videoID: video.id, snapshotID: snapshotID,
+                    title: video.title, useTVHTML5UserAgent: false
+                )
+                try Task.checkCancellation()
+                try FileManager.default.moveItem(at: partial, to: destination)
+                return
+            } catch {
+                try Task.checkCancellation()
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private static func probedMP4Formats(_ formats: [RemoteFormat], maxHeight: Int?) -> [RemoteFormat] {
+        formats.filter { format in
+            guard format.isProgressive, format.protocolKind == .https,
+                  format.url?.scheme?.lowercased() == "https", format.url?.host != nil,
+                  format.ext.lowercased() == "mp4",
+                  let vcodec = format.vcodec?.lowercased(), vcodec.hasPrefix("avc1") || vcodec == "h264",
+                  let acodec = format.acodec?.lowercased(), acodec.hasPrefix("mp4a") || acodec == "aac" else { return false }
+            return maxHeight.map { (format.height ?? .max) <= $0 } ?? true
+        }
+        .sorted { ($0.height ?? 0) > ($1.height ?? 0) }
+    }
+
+    /// Fallback path that runs when yt-dlp fails to produce a usable file. Uses
     /// `VideoService.fetchInfoViaTVHTML5` (which goes through `YouTubeKitClient.tvHtmlModel`
     /// — TVHTML5_SIMPLY_EMBEDDED_PLAYER context, the client profile YouTube exempts from PoT
     /// enforcement) to get fresh stream URLs, then downloads the bytes directly via
@@ -717,15 +765,15 @@ final class DownloadManager: TemporaryDownloading {
         guard !formats.isEmpty else {
             throw YouTubeServiceError.streamExtractionFailed
         }
-        let maxHeight = Self.targetHeight(for: quality)
+        let maxHeight = quality == .audioOnly ? 1080 : quality.heightCap ?? .max
+        let videoFormat = pickBestVideoOnly(formats: formats, maxHeight: maxHeight)
+        let audioFormat = pickBestAudioOnly(formats: formats)
 
         try? FileManager.default.removeItem(at: destination)
 
-        // **Strategy 1: progressive single-file format.** itag 18 (360p mp4 with both tracks)
-        // ships as a single file, no mux step. Always tried first because it's the simplest
-        // and fastest path when available.
         if let progressive = pickBestProgressive(formats: formats, maxHeight: maxHeight),
-           let url = progressive.url {
+           let url = progressive.url,
+           audioFormat == nil || (progressive.height ?? 0) >= (videoFormat?.height ?? 0) {
             log.info("yt-dlp[\(video.id, privacy: .public)] fallback: progressive height=\(progressive.height ?? 0, privacy: .public)")
             try await downloadStream(from: url, to: destination, videoID: video.id, snapshotID: snapshotID, title: video.title)
             return
@@ -734,8 +782,6 @@ final class DownloadManager: TemporaryDownloading {
         // **Strategy 2: adaptive — separate video-only and audio-only streams.** Required for
         // anything ≥ 720p (YouTube doesn't ship progressive at those resolutions). Download
         // both, then mux with ffmpeg `-c copy` so we get a single playable mp4.
-        let videoFormat = pickBestVideoOnly(formats: formats, maxHeight: maxHeight)
-        let audioFormat = pickBestAudioOnly(formats: formats)
         guard let videoFormat, let videoURL = videoFormat.url,
               let audioFormat, let audioURL = audioFormat.url else {
             log.error("yt-dlp[\(video.id, privacy: .public)] fallback: no suitable formats found")
@@ -804,21 +850,29 @@ final class DownloadManager: TemporaryDownloading {
 
     /// Downloads a single stream to `destination` with periodic progress updates fed into
     /// `handleProgress` so the UI's progress bar moves.
-    private func downloadStream(from url: URL, to destination: URL, videoID: String, snapshotID: String, title: String) async throws {
+    private func downloadStream(
+        from url: URL, to destination: URL, videoID: String, snapshotID: String, title: String,
+        useTVHTML5UserAgent: Bool = true
+    ) async throws {
         try? FileManager.default.removeItem(at: destination)
         var request = URLRequest(url: url)
         // Match the TVHTML5_SIMPLY_EMBEDDED_PLAYER user-agent we set on `tvHtmlModel`.
         // The CDN occasionally rejects requests whose UA doesn't match the client that minted
         // the URL.
-        request.setValue("Mozilla/5.0 (PlayStation; PlayStation 4/12.55) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        if useTVHTML5UserAgent {
+            request.setValue("Mozilla/5.0 (PlayStation; PlayStation 4/12.55) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        }
 
         let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw YouTubeServiceError.streamExtractionFailed
         }
-        guard (200..<300).contains(http.statusCode) else {
-            log.error("[fallback] HTTP \(http.statusCode, privacy: .public) from \(url.host ?? "?", privacy: .public)\(url.path, privacy: .public)")
-            throw YouTubeServiceError.streamExtractionFailed
+        guard http.statusCode == 200 else {
+            log.error("[fallback] Unexpected HTTP status \(http.statusCode, privacy: .public) from \(url.host ?? "?", privacy: .public)")
+            throw URLError(.badServerResponse)
+        }
+        if let mimeType = http.mimeType, mimeType.hasPrefix("text/") || mimeType == "application/json" {
+            throw URLError(.cannotDecodeContentData)
         }
         let expected = http.expectedContentLength
         let total = expected > 0 ? Int(expected) : 0
@@ -858,6 +912,9 @@ final class DownloadManager: TemporaryDownloading {
             try handle.write(contentsOf: buffer)
             written += buffer.count
         }
+        guard written > 0, total == 0 || written == total else {
+            throw URLError(.cannotDecodeContentData)
+        }
         try handle.close()
         log.info("[fallback] wrote \(written, privacy: .public) bytes to \(destination.lastPathComponent, privacy: .public)")
     }
@@ -871,13 +928,15 @@ final class DownloadManager: TemporaryDownloading {
             .max { ($0.height ?? 0) < ($1.height ?? 0) }
     }
 
-    /// Highest-resolution video-only mp4 within the cap. Prefer mp4 over webm so the downstream
-    /// `ffmpeg -c copy` mux works without re-encoding.
+    /// Highest-resolution video-only format within the cap. Prefer MP4 at equal resolution.
     private func pickBestVideoOnly(formats: [VideoFormat], maxHeight: Int) -> VideoFormat? {
         let candidates = formats.filter { $0.isVideoOnly && $0.url != nil && ($0.height ?? Int.max) <= maxHeight }
-        let mp4s = candidates.filter { $0.mimeType.lowercased().contains("mp4") }
-        let pool = mp4s.isEmpty ? candidates : mp4s
-        return pool.max { ($0.height ?? 0) < ($1.height ?? 0) }
+        return candidates.max { lhs, rhs in
+            let lhsHeight = lhs.height ?? 0
+            let rhsHeight = rhs.height ?? 0
+            if lhsHeight != rhsHeight { return lhsHeight < rhsHeight }
+            return !lhs.mimeType.lowercased().contains("mp4") && rhs.mimeType.lowercased().contains("mp4")
+        }
     }
 
     /// Highest-bitrate audio-only m4a/mp4. Same mp4-preference rule as video to keep the mux
@@ -887,13 +946,6 @@ final class DownloadManager: TemporaryDownloading {
         let mp4s = candidates.filter { $0.mimeType.lowercased().contains("mp4") || $0.mimeType.lowercased().contains("m4a") }
         let pool = mp4s.isEmpty ? candidates : mp4s
         return pool.max { ($0.bitrate ?? 0) < ($1.bitrate ?? 0) }
-    }
-
-    private static func targetHeight(for quality: VideoQuality) -> Int {
-        // Reuse the existing `heightCap` so the format selector matches yt-dlp's argv logic.
-        // `audioOnly` → 0 isn't useful for video downloads, fall back to a reasonable cap.
-        let cap = quality.heightCap ?? 1080
-        return cap > 0 ? cap : 1080
     }
 
     // MARK: - Muxing (direct ffmpeg call, no Python)
@@ -955,148 +1007,6 @@ final class DownloadManager: TemporaryDownloading {
         }
     }
 
-    /// Legacy AVAssetExportSession path — kept private and unused for now. It can't handle YouTube's
-    /// DASH-fragmented mp4 correctly (see `muxToDestination` for the gory details).
-    @available(*, deprecated)
-    private func muxViaAVFoundation(video: URL, audio: URL, destination: URL) async throws {
-        log.info("mux: video=\(video.lastPathComponent, privacy: .public) audio=\(audio.lastPathComponent, privacy: .public)")
-        let videoAsset = AVURLAsset(url: video)
-        let audioAsset = AVURLAsset(url: audio)
-
-        async let videoTracksTask = videoAsset.loadTracks(withMediaType: .video)
-        async let audioTracksTask = audioAsset.loadTracks(withMediaType: .audio)
-        async let videoDurationTask = videoAsset.load(.duration)
-        async let audioDurationTask = audioAsset.load(.duration)
-
-        let (vTracks, aTracks, videoDur, audioDur) = try await (
-            videoTracksTask, audioTracksTask, videoDurationTask, audioDurationTask
-        )
-
-        guard let videoTrack = vTracks.first else {
-            log.error("mux: no video track in \(video.lastPathComponent, privacy: .public)")
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-        guard let audioTrack = aTracks.first else {
-            log.error("mux: no audio track in \(audio.lastPathComponent, privacy: .public)")
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-
-        let videoTrackRange = try await videoTrack.load(.timeRange)
-        let audioTrackRange = try await audioTrack.load(.timeRange)
-        let videoSegments = try await videoTrack.load(.segments)
-        let audioSegments = try await audioTrack.load(.segments)
-
-        log.info("mux: asset durations video=\(videoDur.seconds, privacy: .public)s audio=\(audioDur.seconds, privacy: .public)s")
-        log.info("mux: track ranges video=[start=\(videoTrackRange.start.seconds, privacy: .public), dur=\(videoTrackRange.duration.seconds, privacy: .public)] audio=[start=\(audioTrackRange.start.seconds, privacy: .public), dur=\(audioTrackRange.duration.seconds, privacy: .public)]")
-        log.info("mux: segments video=\(videoSegments.count, privacy: .public) audio=\(audioSegments.count, privacy: .public)")
-        for (i, seg) in videoSegments.enumerated() {
-            log.info("mux:   video.seg[\(i, privacy: .public)] empty=\(seg.isEmpty, privacy: .public) src=[\(seg.timeMapping.source.start.seconds, privacy: .public), dur=\(seg.timeMapping.source.duration.seconds, privacy: .public)] tgt=[\(seg.timeMapping.target.start.seconds, privacy: .public), dur=\(seg.timeMapping.target.duration.seconds, privacy: .public)]")
-        }
-        for (i, seg) in audioSegments.enumerated() {
-            log.info("mux:   audio.seg[\(i, privacy: .public)] empty=\(seg.isEmpty, privacy: .public) src=[\(seg.timeMapping.source.start.seconds, privacy: .public), dur=\(seg.timeMapping.source.duration.seconds, privacy: .public)] tgt=[\(seg.timeMapping.target.start.seconds, privacy: .public), dur=\(seg.timeMapping.target.duration.seconds, privacy: .public)]")
-        }
-
-        // The track's *real* media content range is the first non-empty segment's source range.
-        // Edit lists can stack multiple identical segments to produce a presentation that plays the
-        // same bytes twice; we ignore that and only insert the underlying media data once.
-        let firstVideoSegment = videoSegments.first(where: { !$0.isEmpty }).map { $0.timeMapping.source }
-        let firstAudioSegment = audioSegments.first(where: { !$0.isEmpty }).map { $0.timeMapping.source }
-        let videoMediaRange = firstVideoSegment ?? CMTimeRange(start: .zero, duration: videoDur)
-        let audioMediaRange = firstAudioSegment ?? CMTimeRange(start: .zero, duration: audioDur)
-        log.info("mux: chosen video media range=[start=\(videoMediaRange.start.seconds, privacy: .public), dur=\(videoMediaRange.duration.seconds, privacy: .public)]")
-        log.info("mux: chosen audio media range=[start=\(audioMediaRange.start.seconds, privacy: .public), dur=\(audioMediaRange.duration.seconds, privacy: .public)]")
-
-        let cap = CMTimeMinimum(videoDur, audioDur)
-        let mergedDuration = CMTimeMinimum(
-            CMTimeMinimum(videoMediaRange.duration, audioMediaRange.duration),
-            cap
-        )
-        log.info("mux: merged target duration=\(mergedDuration.seconds, privacy: .public)s (cap=\(cap.seconds, privacy: .public)s)")
-
-        let composition = AVMutableComposition()
-        guard let compVideo = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
-              let compAudio = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-            log.error("mux: failed to create composition tracks")
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-
-        // Read from each segment's media-domain start (which AVFoundation uses to look up samples in
-        // the underlying mdat) and clamp to the merged duration so neither track plays past where
-        // both have content. Both inserts target composition timeline `.zero` — overlay, not concat.
-        let videoInsertRange = CMTimeRange(start: videoMediaRange.start, duration: mergedDuration)
-        let audioInsertRange = CMTimeRange(start: audioMediaRange.start, duration: mergedDuration)
-        log.info("mux: inserting video range=[\(videoInsertRange.start.seconds, privacy: .public), dur=\(videoInsertRange.duration.seconds, privacy: .public)] audio range=[\(audioInsertRange.start.seconds, privacy: .public), dur=\(audioInsertRange.duration.seconds, privacy: .public)]")
-        try compVideo.insertTimeRange(videoInsertRange, of: videoTrack, at: .zero)
-        try compAudio.insertTimeRange(audioInsertRange, of: audioTrack, at: .zero)
-
-        log.info("mux: composition built. duration=\(composition.duration.seconds, privacy: .public)s tracks=\(composition.tracks.count, privacy: .public)")
-        for (i, track) in composition.tracks.enumerated() {
-            log.info("mux:  comp.tracks[\(i, privacy: .public)] mediaType=\(track.mediaType.rawValue, privacy: .public) segments=\(track.segments.count, privacy: .public) timeRange=[start=\(track.timeRange.start.seconds, privacy: .public), dur=\(track.timeRange.duration.seconds, privacy: .public)]")
-        }
-
-        // Diagnostic — if the composition is somehow longer than the media-duration cap, the rest of
-        // the file would be garbage on playback. Bail rather than ship a broken mp4.
-        if composition.duration > CMTimeMultiplyByFloat64(cap, multiplier: 1.05) {
-            log.error("mux: composition duration \(composition.duration.seconds, privacy: .public)s exceeds 105%% of media cap \(cap.seconds, privacy: .public)s — refusing to export this would be doubled")
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-
-        try? FileManager.default.removeItem(at: destination)
-
-        // Passthrough first; only re-encode if passthrough refuses the codec combo.
-        if try await runExport(composition: composition, preset: AVAssetExportPresetPassthrough, destination: destination) {
-            await logExportedDuration(destination)
-            log.info("mux: passthrough export succeeded → \(destination.path, privacy: .public)")
-            return
-        }
-        log.notice("mux: passthrough rejected the codec combo, re-encoding via HighestQuality preset")
-        if try await runExport(composition: composition, preset: AVAssetExportPresetHighestQuality, destination: destination) {
-            await logExportedDuration(destination)
-            log.info("mux: re-encode succeeded → \(destination.path, privacy: .public)")
-            return
-        }
-        throw YouTubeServiceError.streamExtractionFailed
-    }
-
-    /// Loads the duration of the exported file and logs it. Helps confirm the mux produced a file
-    /// of the expected length — if you ever see "doubled" again, this line catches it.
-    private func logExportedDuration(_ url: URL) async {
-        let asset = AVURLAsset(url: url)
-        if let duration = try? await asset.load(.duration) {
-            log.info("mux: exported file duration=\(duration.seconds, privacy: .public)s path=\(url.lastPathComponent, privacy: .public)")
-        }
-    }
-
-    /// Runs one `AVAssetExportSession` invocation against `composition` with `preset` and writes to
-    /// `destination`. Returns true on .completed, false on .cancelled, throws on .failed.
-    private func runExport(composition: AVMutableComposition, preset: String, destination: URL) async throws -> Bool {
-        guard let session = AVAssetExportSession(asset: composition, presetName: preset) else {
-            log.error("mux: could not init AVAssetExportSession for preset=\(preset, privacy: .public)")
-            return false
-        }
-        session.outputURL = destination
-        session.outputFileType = .mp4
-        session.shouldOptimizeForNetworkUse = true
-
-        log.debug("mux: export start preset=\(preset, privacy: .public)")
-        await session.export()
-
-        switch session.status {
-        case .completed:
-            return true
-        case .failed:
-            let err = session.error?.localizedDescription ?? "unknown"
-            log.error("mux: export failed preset=\(preset, privacy: .public) error=\(err, privacy: .public)")
-            return false
-        case .cancelled:
-            log.notice("mux: export cancelled preset=\(preset, privacy: .public)")
-            return false
-        default:
-            log.error("mux: export ended in unexpected state \(session.status.rawValue, privacy: .public)")
-            return false
-        }
-    }
-
     // MARK: - File locations + format selection
 
     /// Canonical on-disk location for a downloaded video. Files land at the **Documents
@@ -1109,17 +1019,6 @@ final class DownloadManager: TemporaryDownloading {
         return docs.appendingPathComponent("\(videoID).mp4")
     }
 
-    /// Builds a yt-dlp `-f` format string honoring the user's quality preference.
-    ///
-    /// **yt-dlp evaluates `/` left-to-right and picks the FIRST clause that matches.** So clause
-    /// order matters a lot: we want it to prefer a single combined progressive file when one is
-    /// available (skips the Swift-side ffmpeg mux entirely), and only fall back to the split
-    /// `bestvideo,bestaudio` path when no combined file fits the cap.
-    ///
-    /// At 360p YouTube ships itag 18 (h264 + aac combined mp4) for nearly every video — so a 360p
-    /// preference should always end up as a single-file download. Above 360p YouTube only delivers
-    /// DASH-split streams, so the split clause kicks in and our ffmpeg mux joins them.
-    ///
     /// Materializes a temporary Netscape-format `cookies.txt` from the user's stored YouTube
     /// cookie header, suitable for yt-dlp's `--cookies <path>` flag.
     ///
@@ -1171,25 +1070,14 @@ final class DownloadManager: TemporaryDownloading {
         }
     }
 
-    /// We use `,` (download as separate files) instead of `+` (yt-dlp's merger) because yt-dlp's
-    /// ffmpeg invocation hangs on iOS — see `muxToDestination` for the Swift-side replacement.
+    /// `bestvideo*` considers progressive and video-only tracks together. yt-dlp adds the
+    /// audio-only track only when the chosen video has no embedded audio.
     private static func formatString(for quality: VideoQuality) -> String {
         if quality == .audioOnly {
             return "bestaudio[ext=m4a]/bestaudio"
         }
-        if let cap = quality.heightCap, cap > 0 {
-            return [
-                // 1. Single combined progressive mp4 within the height cap (itag 18 for 360p).
-                "best[height<=\(cap)][ext=mp4]",
-                // 2. Same but any container (covers rare webm progressive).
-                "best[height<=\(cap)]",
-                // 3. Fall back to split DASH streams — our Swift-side mux joins them.
-                "bestvideo[height<=\(cap)][ext=mp4],bestaudio[ext=m4a]",
-                // 4. Whatever yt-dlp considers best as a last resort.
-                "best"
-            ].joined(separator: "/")
-        }
-        return "best[ext=mp4]/best/bestvideo[ext=mp4],bestaudio[ext=m4a]"
+        let cap = quality.heightCap.map { "[height<=\($0)]" } ?? ""
+        return "bestvideo*\(cap)+bestaudio[ext=m4a]/best\(cap)"
     }
 
     // MARK: - Networking gate + snapshots
@@ -1202,10 +1090,20 @@ final class DownloadManager: TemporaryDownloading {
         pathMonitor.start(queue: DispatchQueue(label: "DownloadManager.path"))
     }
 
-    private func waitForAllowedNetwork() async throws {
+    var currentDownloadQuality: VideoQuality {
+        downloadQuality(for: currentPath ?? pathMonitor.currentPath)
+    }
+
+    private func downloadQuality(for path: NWPath) -> VideoQuality {
+        if path.status != .satisfied || (path.usesInterfaceType(.cellular) && !path.usesInterfaceType(.wifi)) {
+            return preferences.cellularDownloadQuality
+        }
+        return preferences.wifiDownloadQuality
+    }
+
+    private func checkAllowedNetwork(_ path: NWPath) throws {
         // Permissive default: if the user allows cellular, never block.
         if preferences.allowCellularDownloads { return }
-        let path = currentPath ?? pathMonitor.currentPath
         if path.usesInterfaceType(.wifi) { return }
         throw YouTubeServiceError.network(NSError(
             domain: "FreeTube.DownloadManager",
