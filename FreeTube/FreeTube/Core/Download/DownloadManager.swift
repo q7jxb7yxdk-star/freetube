@@ -3,6 +3,7 @@ import CoreMedia
 import FFmpegSupport
 import Foundation
 import Network
+import os
 import OSLog
 import PythonKit
 import SwiftData
@@ -30,9 +31,10 @@ actor PythonRunner {
         argv: [String],
         progress: @escaping @Sendable ([String: PythonObject]) -> Void,
         log: @escaping @Sendable (String, String) -> Void,
+        onStart: @escaping @Sendable (ContinuousClock.Instant) -> Void,
         priority: Priority = .low
     ) async throws {
-        try await submit(priority: priority) {
+        try await submit(priority: priority, onStart: onStart) {
             try freetube_yt_dlp(argv: argv, progress: progress, log: log)
         }
     }
@@ -44,10 +46,13 @@ actor PythonRunner {
 
     private func submit<T: Sendable>(
         priority: Priority,
+        onStart: (@Sendable (ContinuousClock.Instant) -> Void)? = nil,
         _ work: @escaping @Sendable () throws -> T
     ) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
+            let queuedAt = ContinuousClock.now
             let job: Job = {
+                onStart?(queuedAt)
                 do {
                     let moduleURL = try YtDlpModule.activeArchive()
                     let result = try EmbeddedPython.withInterpreter(moduleURL: moduleURL) {
@@ -290,7 +295,7 @@ final class DownloadManager: TemporaryDownloading {
     // MARK: - yt-dlp execution
 
     private func runYoutubeDLDownload(video: Video, quality: VideoQuality, priority: DownloadPriority = .background) async throws -> URL {
-        let startedAt = Date()
+        let startedAt = ContinuousClock.now
         log.info("yt-dlp[\(video.id, privacy: .public)] runYoutubeDLDownload start quality=\(quality.rawValue, privacy: .public)")
         let snapshotID = UUID().uuidString
         log.debug("yt-dlp[\(video.id, privacy: .public)] snapshotID=\(snapshotID, privacy: .public) → state=queued")
@@ -318,6 +323,7 @@ final class DownloadManager: TemporaryDownloading {
         }.value
         await removeYtDlpIntermediates(at: destination)
         try Task.checkCancellation()
+        async let thumbnail = Self.downloadThumbnailData(url: video.thumbnailURL)
 
         // Select the best video stream with audio. When the streams are separate, yt-dlp
         // writes each track and Swift muxes them using the in-process FFmpeg library.
@@ -408,7 +414,9 @@ final class DownloadManager: TemporaryDownloading {
 
         do {
             log.info("yt-dlp[\(video.id, privacy: .public)] invoking yt-dlp via PythonRunner")
-            try await PythonRunner.shared.run(argv: argv, progress: { [weak self] dict in
+            let videoID = video.id
+            let workerStartedAt = OSAllocatedUnfairLock(initialState: ContinuousClock.Instant?.none)
+            try await PythonRunner.shared.run(argv: argv, progress: { [weak self, log] dict in
                 guard let self else { return }
                 // CRITICAL: PythonKit's `PythonObject` is reference-counted on Python's GIL thread.
                 // If we capture the `[String: PythonObject]` dict into a `Task { @MainActor in ... }`
@@ -418,6 +426,15 @@ final class DownloadManager: TemporaryDownloading {
                 // thread, then ship only those primitives across the actor boundary.
                 let status = String(dict["status"] ?? "") ?? ""
                 let downloaded = Int(dict["downloaded_bytes"] ?? 0) ?? 0
+                if status == "downloading", downloaded > 0,
+                   let startedAt = workerStartedAt.withLock({ instant in
+                       let startedAt = instant
+                       instant = nil
+                       return startedAt
+                   }) {
+                    let elapsed = startedAt.duration(to: .now)
+                    log.info("yt-dlp[\(videoID, privacy: .public)] first download progress after \(String(describing: elapsed), privacy: .public) on worker")
+                }
                 let total = Int(dict["total_bytes"] ?? dict["total_bytes_estimate"] ?? 0) ?? 0
                 let speed = Int(dict["speed"] ?? 0) ?? 0
                 let eta = Int(dict["eta"] ?? 0) ?? 0
@@ -464,7 +481,12 @@ final class DownloadManager: TemporaryDownloading {
                         self?.progressByVideoID.removeValue(forKey: id)
                     }
                 }
+            }, onStart: { [log] queuedAt in
+                let now = ContinuousClock.now
+                workerStartedAt.withLock { $0 = now }
+                log.info("yt-dlp[\(videoID, privacy: .public)] worker started after \(String(describing: queuedAt.duration(to: now)), privacy: .public) in queue")
             }, priority: priority == .userInitiated ? .high : .low)
+            log.info("yt-dlp[\(videoID, privacy: .public)] transfer finished")
             try Task.checkCancellation()
             try await finalizeYtDlpOutput(at: destination, videoID: video.id)
         } catch {
@@ -505,16 +527,16 @@ final class DownloadManager: TemporaryDownloading {
             }
         }
 
+        let thumbnailData = await thumbnail
         if Task.isCancelled {
             try? FileManager.default.removeItem(at: destination)
             throw CancellationError()
         }
-        let elapsed = Date().timeIntervalSince(startedAt)
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value ?? 0
         log.info("yt-dlp[\(video.id, privacy: .public)] file on disk: size=\(fileSize, privacy: .public) bytes path=\(destination.path, privacy: .public)")
 
         log.debug("yt-dlp[\(video.id, privacy: .public)] writing download metadata xattr")
-        await persistDownloaded(video: video, fileURL: destination)
+        persistDownloaded(video: video, fileURL: destination, thumbnail: thumbnailData)
 
         log.debug("yt-dlp[\(video.id, privacy: .public)] → state=completed")
         publish(snapshot: DownloadTaskSnapshot(
@@ -531,7 +553,8 @@ final class DownloadManager: TemporaryDownloading {
             self.publishSnapshots()
         }
 
-        log.info("yt-dlp[\(video.id, privacy: .public)] SUCCESS in \(String(format: "%.1f", elapsed), privacy: .public)s → \(destination.path, privacy: .public)")
+        let elapsed = startedAt.duration(to: .now)
+        log.info("yt-dlp[\(video.id, privacy: .public)] SUCCESS in \(String(describing: elapsed), privacy: .public) → \(destination.path, privacy: .public)")
         return destination
     }
 
@@ -655,10 +678,9 @@ final class DownloadManager: TemporaryDownloading {
 
     // MARK: - SwiftData
 
-    private func persistDownloaded(video: Video, fileURL: URL) async {
+    private func persistDownloaded(video: Video, fileURL: URL, thumbnail: Data?) {
         let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value ?? 0
-        let thumb = await downloadThumbnailData(url: video.thumbnailURL)
-        log.debug("persistDownloaded(\(video.id, privacy: .public)) thumb=\(thumb == nil ? "nil" : "\(thumb!.count)B", privacy: .public) size=\(size, privacy: .public)")
+        log.debug("persistDownloaded(\(video.id, privacy: .public)) thumbnailBytes=\(thumbnail?.count ?? 0, privacy: .public) size=\(size, privacy: .public)")
         // File-system + xattr backed (no SwiftData): the metadata travels with the file.
         // `DownloadsStore.write` compresses the thumbnail to ~10 KB JPEG and posts the
         // change notification so the Downloads tab re-renders.
@@ -668,7 +690,7 @@ final class DownloadManager: TemporaryDownloading {
             channelName: video.channelName,
             formatID: "ytdl",
             originalURL: nil,
-            rawThumbnail: thumb,
+            rawThumbnail: thumbnail,
             at: fileURL
         )
         log.info("persistDownloaded(\(video.id, privacy: .public)) wrote xattr size=\(size, privacy: .public) bytes")
@@ -683,7 +705,7 @@ final class DownloadManager: TemporaryDownloading {
         DownloadsStore.shared.enforceCacheLimit(limit)
     }
 
-    private func downloadThumbnailData(url: URL?) async -> Data? {
+    private nonisolated static func downloadThumbnailData(url: URL?) async -> Data? {
         guard let url else { return nil }
         return try? await URLSession.shared.data(from: url).0
     }
@@ -863,6 +885,7 @@ final class DownloadManager: TemporaryDownloading {
             request.setValue("Mozilla/5.0 (PlayStation; PlayStation 4/12.55) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         }
 
+        let startedAt = ContinuousClock.now
         let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw YouTubeServiceError.streamExtractionFailed
@@ -890,6 +913,10 @@ final class DownloadManager: TemporaryDownloading {
         buffer.reserveCapacity(65_536)
         var written = 0
         for try await byte in asyncBytes {
+            if written == 0, buffer.isEmpty {
+                let elapsed = startedAt.duration(to: .now)
+                log.info("[fallback][\(videoID, privacy: .public)] first download byte after \(String(describing: elapsed), privacy: .public)")
+            }
             buffer.append(byte)
             if buffer.count >= 65_536 {
                 try handle.write(contentsOf: buffer)
@@ -981,15 +1008,15 @@ final class DownloadManager: TemporaryDownloading {
         ]
         log.info("ffmpeg argv: \(args.joined(separator: " "), privacy: .public)")
 
-        let startedAt = Date()
+        let startedAt = ContinuousClock.now
         // Route every ffmpeg invocation through the shared `FFmpegRunner` actor. ffmpeg's C
         // library is **not** thread-safe — the `+faststart` post-pass crashes on concurrent
         // calls (see FFmpegRunner doc comment). Plain `Task.detached` here was the bug: each
         // parallel playlist download finishing its yt-dlp step fired its own ffmpeg detach,
         // and two of them stomping global buffers blew up inside `ff_format_shift_data`.
         let exitCode = await FFmpegRunner.shared.run(args)
-        let elapsed = Date().timeIntervalSince(startedAt)
-        log.info("ffmpeg returned exit=\(exitCode, privacy: .public) in \(String(format: "%.1f", elapsed), privacy: .public)s")
+        let elapsed = startedAt.duration(to: .now)
+        log.info("ffmpeg[\(destination.lastPathComponent, privacy: .public)] returned exit=\(exitCode, privacy: .public) after \(String(describing: elapsed), privacy: .public) including queue time")
 
         guard exitCode == 0 else {
             log.error("ffmpeg failed exit=\(exitCode, privacy: .public)")

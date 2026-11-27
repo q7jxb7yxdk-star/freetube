@@ -1,5 +1,5 @@
 {
-  "originHash" : "ecf524e8163c8cfcb5b09dd0fbd16a569d4edbef43c09f01c216081c41cd454c",
+  "originHash" : "2990c8203470c8a18c75c9a4f848064e9dd1871abd8cc3c37a76bb54adcf6f55",
   "pins" : [
     {
       "identity" : "ffmpeg-ios-support",
@@ -71,6 +71,14 @@
       "state" : {
         "revision" : "b6cff801f62d5cb45372461666a5e0bf4cac9447",
         "version" : "1.2.0"
+      }
+    },
+    {
+      "identity" : "vlckit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/videolan/vlckit.git",
+      "state" : {
+        "revision" : "3d0f0fa7031eab1a67c817c98a495e1c68fc998c"
       }
     },
     {

@@ -62,7 +62,9 @@ nonisolated func freetube_yt_dlp(
 
 /// Probes formats without downloading. The caller converts the result before leaving PythonRunner.
 @available(iOS 17.0, *)
-nonisolated func freetube_yt_dlp_extract_info(url: String, useVisionOSClient: Bool) throws -> PythonObject {
+nonisolated func freetube_yt_dlp_extract_info(
+    url: String, useVisionOSClient: Bool = false, forSubtitles: Bool = false
+) throws -> PythonObject {
     let module = try YtDlpModule.load()
     let log = AppLog(subsystem: "com.leshko.freetube", category: "ytdlp")
     let youtubeOptions = useVisionOSClient
@@ -78,6 +80,17 @@ nonisolated func freetube_yt_dlp_extract_info(url: String, useVisionOSClient: Bo
         // FFmpeg runs in Swift, so skip yt-dlp's subprocess probe.
         "ffmpeg_location": "/dev/null/no-ffmpeg".pythonObject,
     ])
+    if forSubtitles {
+        // Use yt-dlp's default YouTube clients for caption discovery. The playback
+        // clients prioritize stream formats and may omit usable caption URLs.
+        options["extractor_args"] = PythonObject([String: [String]]())
+        options["writesubtitles"] = true
+        options["writeautomaticsub"] = true
+        options["ignore_no_formats_error"] = true
+        options["socket_timeout"] = 10
+        options["retries"] = 0
+        options["extractor_retries"] = 0
+    }
     options["logger"] = try makeYtDlpLogger { level, message in
         switch level {
         case "error": log.error("\(message, privacy: .public)")

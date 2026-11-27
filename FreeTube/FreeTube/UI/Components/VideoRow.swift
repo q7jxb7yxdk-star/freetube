@@ -1,5 +1,6 @@
 import SwiftUI
 import Kingfisher
+import UIKit
 
 /// Horizontal compact video row — used in search results, history, library lists.
 ///
@@ -9,8 +10,10 @@ import Kingfisher
 @available(iOS 17.0, *)
 struct VideoRow: View {
     let video: Video
+    var localThumbnailData: Data? = nil
     var onTap: () -> Void = {}
     var showsMoreMenu: Bool = false
+    private let thumbnailSize = CGSize(width: 168, height: 96)
 
     /// Playback count + relative upload date joined by a middle dot. Either half can be empty
     /// (older listings sometimes omit one), so we filter before joining to avoid stray separators.
@@ -34,16 +37,25 @@ struct VideoRow: View {
         }
     }
 
+    @ViewBuilder
+    private var thumbnail: some View {
+        if let localThumbnailData, let image = UIImage(data: localThumbnailData) {
+            Image(uiImage: image).resizable()
+        } else {
+            KFImage(video.thumbnailURL)
+                .thumbnail(size: thumbnailSize) {
+                    Color.gray.opacity(0.2)
+                }
+                .resizable()
+        }
+    }
+
     private var content: some View {
         HStack(alignment: .top, spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
-                KFImage(video.thumbnailURL)
-                    .thumbnail(size: CGSize(width: 168, height: 96)) {
-                        Color.gray.opacity(0.2)
-                    }
-                    .resizable()
+                thumbnail
                     .scaledToFill()
-                    .frame(width: 168, height: 96)
+                    .frame(width: thumbnailSize.width, height: thumbnailSize.height)
                     .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: 8))
 
@@ -58,7 +70,7 @@ struct VideoRow: View {
                         .padding(4)
                 }
             }
-            .frame(width: 168, height: 96)
+            .frame(width: thumbnailSize.width, height: thumbnailSize.height)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(video.title)

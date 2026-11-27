@@ -1,12 +1,11 @@
 import SwiftUI
-import SwiftData
 
 @available(iOS 17.0, *)
 struct HistoryScreen: View {
     let showsYouTubeHistory: Bool
 
-    @Query(sort: \WatchHistoryEntry.watchedAt, order: .reverse) private var localHistory: [WatchHistoryEntry]
     @State private var model = HistoryViewModel()
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(PlayerStateManager.self) private var player
 
     /// Distance from the end at which we kick off the next page. 5 keeps the next chunk warm
@@ -15,27 +14,17 @@ struct HistoryScreen: View {
 
     var body: some View {
         List {
-            Section("On this device") {
-                if localHistory.isEmpty {
-                    Text("No videos played yet")
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(localHistory, id: \.videoID) { entry in
-                    let video = makeVideo(from: entry)
-                    VideoRow(video: video, onTap: { player.load(video) }, showsMoreMenu: true)
-                }
-            }
-
             if showsYouTubeHistory {
-                Section("YouTube history") {
-                    youtubeHistory
-                }
+                youtubeHistory
+            } else {
+                Text("Sign in to YouTube")
+                    .foregroundStyle(.secondary)
             }
         }
         .listStyle(.plain)
         .navigationTitle("History")
-        .task(id: showsYouTubeHistory) {
-            if showsYouTubeHistory { await model.load() }
+        .task(id: showsYouTubeHistory && scenePhase == .active) {
+            if showsYouTubeHistory, scenePhase == .active { await model.load() }
         }
         .refreshable {
             if showsYouTubeHistory { await model.load() }
@@ -45,11 +34,12 @@ struct HistoryScreen: View {
 
     @ViewBuilder
     private var youtubeHistory: some View {
-        ForEach(Array(model.videos.enumerated()), id: \.element.id) { index, video in
-            VideoRow(video: video, onTap: { player.load(video) }, showsMoreMenu: true)
+        ForEach(Array(model.items.enumerated()), id: \.element.video.id) { index, item in
+            VideoRow(video: item.video, onTap: { player.load(item.video, startAt: item.startAt) }, showsMoreMenu: true)
+                .disabled(model.isLoading)
                 .swipeActions {
                     Button(role: .destructive) {
-                        Task { await model.remove(video) }
+                        Task { await model.remove(item.video) }
                     } label: {
                         Label("Remove", systemImage: "trash")
                     }
@@ -69,25 +59,8 @@ struct HistoryScreen: View {
         }
     }
 
-    private func makeVideo(from entry: WatchHistoryEntry) -> Video {
-        Video(
-            id: entry.videoID,
-            title: entry.title,
-            channelID: "",
-            channelName: entry.channelName,
-            channelThumbnailURL: nil,
-            thumbnailURL: entry.thumbnailURL,
-            duration: entry.duration > 0 ? entry.duration : nil,
-            viewCount: nil,
-            publishedAt: nil,
-            descriptionSnippet: nil,
-            isLive: false,
-            isShort: false
-        )
-    }
-
     private func prefetchIfNeeded(currentIndex: Int) {
-        guard currentIndex >= model.videos.count - prefetchLookahead else { return }
+        guard currentIndex >= model.items.count - prefetchLookahead else { return }
         guard model.canLoadMore else { return }
         Task { await model.loadMore() }
     }

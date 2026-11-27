@@ -4,13 +4,14 @@ import UIKit
 import OSLog
 import Kingfisher
 
-/// Expanded player content presented by `LNPopupUI` when the popup bar is opened. The popup chrome
-/// (close button) is provided by the library — this view renders the surface, transport controls,
-/// metadata, and the toggleable comments / queue panel below.
+/// Playback content in the expanded `LNPopupUI` popup, with transport controls and a
+/// comments or queue panel in the standard layout.
 @available(iOS 17.0, *)
 struct FullScreenPlayer: View {
     @Environment(PlayerStateManager.self) private var player
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
+    @Binding var popupDidOpen: Bool
     /// Reactive list of all favorited videos so menu rendering doesn't have to fetch Core Data on
     /// every redraw (which was the bug DownloadsScreen had: per-row SQL on the main queue).
     @Query private var favorites: [FavoriteVideo]
@@ -31,6 +32,9 @@ struct FullScreenPlayer: View {
     /// Non-nil → present the activity controller; tapped row sets this, sheet dismissal clears it.
     @State private var shareFileURL: URL?
     @State private var downloadError: ErrorState?
+    @State private var vlcSeekPosition: TimeInterval?
+    @State private var showsLandscapeControls = false
+    @GestureState private var isHoldingVideo = false
     /// Currently-pushed channel (nil = panel mode). When non-nil, the lower section swaps the
     /// metadata + comments/queue panel for a NavigationStack rooted at `ChannelScreen`. Keeping
     /// the NavigationStack **conditionally mounted** is what makes the panel-mode background
@@ -55,108 +59,81 @@ struct FullScreenPlayer: View {
 
     enum Panel { case comments, queue }
 
+    private var showsNativeVideoSurface: Bool {
+        // A downloaded recording of a live video can still be marked as live.
+        player.isAirPlayMode || (player.currentVideo?.isLive == true
+            && player.vlcPlayback == nil && player.stagedVLCPlayback == nil)
+    }
+
     var body: some View {
-        // Single dark-blur material under EVERYTHING — status bar inset, video chrome, transport,
-        // comments, queue. Removing per-section backgrounds and using one full-screen material lets
-        // the popup read as one continuous translucent surface instead of three stacked tones.
-        //
-        // **Why the outer `GeometryReader`:** we want the video to always be full-width
-        // regardless of how wide vs tall the popup is. `.aspectRatio(16/9, .fit)` clamps the
-        // video to whichever dimension is tighter — on iPhone portrait that's always width
-        // (the screen is much taller than 16:9), but on Mac (Designed-for-iPad) and iPad
-        // landscape the window is wider than 16:9 so `.fit` height-clamps and the video sits
-        // letterboxed inside black side bars. Reading the available width via
-        // `GeometryReader` and sizing the ZStack to `proxy.size.width × width*9/16`
-        // explicitly removes the clamp — full-width on every idiom.
         GeometryReader { proxy in
+            let isLandscape = !MacIntegration.isRunningOnMac && proxy.size.width > proxy.size.height
             VStack(spacing: 0) {
-                // Pinning the ZStack to width × width*9/16 keeps the surface a stable height
-                // across .resolving → .readyToPlay (the underlying
-                // AVPlayerViewController has zero intrinsic size while loading; the explicit
-                // frame here is what stops the layout from jumping when the user taps a queue
-                // item).
-                ZStack {
-                    Color.black
-                    PlayerSurface(player: player.player)
-                    PlaybackStatusOverlay(state: player.loadState)
+                GeometryReader { videoProxy in
+                    playerViewport(size: videoProxy.size, isLandscape: isLandscape)
                 }
-                .frame(width: proxy.size.width, height: proxy.size.width * 9 / 16)
-            // Pull-down-to-dismiss starting from the video surface.
-            //
-            // `AVPlayerViewController`'s internal `UIPanGestureRecognizer`s (scrubber, system
-            // controls) consume touches before they can reach LNPopupUI's outer pan, so the
-            // library's `.popupInteractionStyle(.drag)` only works when the gesture starts on
-            // SwiftUI views below the video (comments / queue). `.simultaneousGesture` is the
-            // escape hatch: SwiftUI composes this `DragGesture` with the UIKit recognizers
-            // underneath instead of arbitrating between them, so AVPlayerViewController's
-            // controls keep working AND we can detect a downward pull and dismiss the popup
-            // imperatively. LNPopupUI animates the collapse — we just flip the binding.
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 30, coordinateSpace: .global)
-                    .onEnded { value in
-                        let mostlyDown = value.translation.height > 90
-                            && abs(value.translation.width) < value.translation.height
-                        let fastFlick = value.predictedEndTranslation.height > 180
-                        if mostlyDown || fastFlick {
-                            @Bindable var p = player
-                            p.fullScreenPresented = false
+                .frame(minHeight: 0, maxHeight: isLandscape ? .infinity : proxy.size.width * 9 / 16)
+                .layoutPriority(1)
+
+                if !isLandscape {
+                    playbackControls(showsPanel: true)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(2)
+
+                    if let video = player.currentVideo {
+                        VStack(spacing: 0) {
+                            if let channel = pushedChannel {
+                                channelStack(channel)
+                            } else {
+                                panel(video)
+                            }
                         }
+                        .frame(minHeight: 44)
                     }
-            )
-
-            transportRow
-                .padding(.vertical, 10)
-
-            Divider()
-
-            if let video = player.currentVideo {
-                // **Two render modes for the lower section, picked by `pushedChannel`:**
-                //
-                // 1. **Panel mode (default, channel == nil):** plain ScrollView, NO
-                //    NavigationStack. The outer VStack's `.background { thinMaterial }` paints
-                //    behind it directly — exactly the same backdrop the transport row above
-                //    shows. This is what makes the visual treatment consistent.
-                //
-                // 2. **Channel-pushed mode (channel != nil):** NavigationStack rooted at
-                //    `ChannelScreen`, with its own thinMaterial inside since the stack's UIKit
-                //    container paints opaque. Channel's own internal NavigationLinks (to
-                //    ChannelTabScreen / PlaylistScreen) push further into this stack.
-                //
-                // The previous version kept the NavigationStack mounted in both modes — that
-                // forced us to paint an inner thinMaterial under the comments/queue panel,
-                // which stacked on top of the stack's opaque container and read noticeably
-                // darker than the transport row. Mounting the stack only when needed fixes it.
-                Group {
-                    if let channel = pushedChannel {
-                        channelStack(channel)
-                    } else {
-                        panel(video)
-                    }
-                }
-                // Reset description state, (best-effort) prefetch the snippet, AND pop any
-                // pushed channel screen whenever the user picks a new video — otherwise tapping
-                // the next video in the queue would leave a stale channel push on screen.
-                .onChange(of: video.id, initial: true) { _, _ in
-                    details = nil
-                    isDetailsExpanded = false
-                    pushedChannel = nil
-                    channelPath = NavigationPath()
-                    prefetchDescriptionIfAvailable(for: video)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .safeAreaInset(edge: .bottom, spacing: isLandscape ? 0 : nil) {
+                if !isLandscape {
+                    closeFullScreenButton
+                        .frame(maxWidth: .infinity)
+                        .padding(.bottom, 8)
+                }
+            }
+            .background {
+                if isLandscape {
+                    Color.black.ignoresSafeArea()
+                } else {
+                    Rectangle().fill(.thinMaterial).ignoresSafeArea()
+                }
+            }
+            .statusBarHidden(isLandscape)
+            .onChange(of: isLandscape) { showsLandscapeControls = false }
         }
-        // One continuous material under EVERYTHING, including the top safe-area inset (status bar).
-        // VStack content still respects safe area; only the material extends behind the inset.
-        .background {
-            Rectangle()
-                .fill(.thinMaterial)
-                .ignoresSafeArea()
-        }
-        // Ensure the system status bar stays visible and gets light-content (white) glyphs against
-        // the dark material. LNPopupUI's `LNPopupContentHostingController` is a UIHostingController
-        // subclass that doesn't override status bar style, so SwiftUI's colorScheme drives it.
         .preferredColorScheme(.dark)
-        .statusBarHidden(false)
+        .onChange(of: player.fullScreenPresented) {
+            if !player.fullScreenPresented {
+                showsLandscapeControls = false
+                player.endPlaybackBoost()
+            }
+        }
+        .onChange(of: popupDidOpen) {
+            if !popupDidOpen { player.endPlaybackBoost() }
+        }
+        .onChange(of: scenePhase) {
+            if scenePhase != .active { player.endPlaybackBoost() }
+        }
+        .onDisappear { player.endPlaybackBoost() }
+        .onChange(of: player.currentVideo?.id, initial: true) {
+            details = nil
+            isDetailsExpanded = false
+            pushedChannel = nil
+            channelPath = NavigationPath()
+            if let video = player.currentVideo { prefetchDescriptionIfAvailable(for: video) }
+        }
+        .task(id: player.fullScreenPresented && player.canLoadYouTubeSubtitles ? player.currentVideo?.id : nil) {
+            player.preloadYouTubeSubtitles()
+        }
         // Presents UIActivityViewController for the "Open in…" menu action. Wrapping shareFileURL
         // in a `Binding<Bool>` that flips when the URL is set/cleared so the sheet lifecycle
         // matches the user's intent.
@@ -187,33 +164,200 @@ struct FullScreenPlayer: View {
         )) {
             Button("OK", role: .cancel) {}
         }
-        // Pull-down-to-dismiss is handled by LNPopupUI via `.popupInteractionStyle(...)` in
-        // RootView. We don't install a custom DragGesture here — it would race with the system
-        // gesture arbitration the popup hosts (and with AVPlayerViewController's own touch
-        // handling once the video surface goes interactive). That was the bug where the
-        // expanded player wouldn't visibly follow the finger during a downward swipe once
-        // playback started; the close was only happening on touch-up.
+        .alert("Couldn't switch playback for AirPlay", isPresented: Binding(
+            get: { player.airPlayHandoffFailed },
+            set: { player.airPlayHandoffFailed = $0 }
+        )) {
+            Button("OK", role: .cancel) {}
+        }
+        .alert("Couldn't load YouTube subtitles", isPresented: Binding(
+            get: { player.youtubeSubtitleLoadFailed },
+            set: { player.youtubeSubtitleLoadFailed = $0 }
+        )) {
+            Button("OK", role: .cancel) {}
+        }
+    }
 
-        // Make the VStack fill the GeometryReader's bounds. Without this, the VStack only
-        // claims the natural content height (video + transport + divider + panel intrinsic
-        // height) and the `.background { thinMaterial }` doesn't extend below that. On
-        // smaller-than-content windows (Mac shrunk) this is invisible; on larger ones
-        // (Mac maximized) you'd see an unfilled gap below the panel.
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        // Bottom-anchored Close button. The button itself is the glass surface
-        // (`.buttonStyle(.glass)` on iOS 26), centered with transparent space around it so
-        // the popup's `thinMaterial` background reads through on either side. `.safeAreaInset`
-        // pushes the panel's ScrollView content up so nothing gets stuck behind the button,
-        // and the inset respects the bottom home-indicator / window safe area automatically.
-        .safeAreaInset(edge: .bottom) {
-            HStack {
-                Spacer()
-                closeFullScreenButton
-                Spacer()
+    private func playerViewport(size: CGSize, isLandscape: Bool) -> some View {
+        let width = min(size.width, size.height * 16 / 9)
+        // Keep one renderer mounted and let it fit the source to the full viewport in landscape.
+        return videoSurface(size: isLandscape ? size : CGSize(width: width, height: width * 9 / 16))
+            .overlay(alignment: .bottom) {
+                if !isLandscape { youtubeSubtitle }
             }
-            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .simultaneousGesture(
+                TapGesture().onEnded { showsLandscapeControls.toggle() },
+                including: isLandscape ? .all : .subviews
+            )
+            .accessibilityActions {
+                if isLandscape {
+                    Button("Show or hide playback controls") { showsLandscapeControls.toggle() }
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if isLandscape {
+                    VStack(spacing: 0) {
+                        youtubeSubtitle
+                        if showsLandscapeControls && !showsNativeVideoSurface {
+                            playbackControls(showsPanel: false)
+                                .background(.black.opacity(0.8))
+                        }
+                    }
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if isLandscape && showsLandscapeControls {
+                    closeFullScreenButton
+                        .padding(8)
+                }
+            }
+    }
+
+    private func videoSurface(size: CGSize) -> some View {
+        ZStack {
+            Color.black
+            if popupDidOpen, player.vlcPlayback != nil || player.stagedVLCPlayback != nil {
+                VLCKitSurface(
+                    activeDrawable: player.vlcPlayback?.drawable,
+                    stagedDrawable: player.stagedVLCPlayback?.drawable,
+                    isCurrentHost: { popupDidOpen },
+                    canStartPlayback: { [weak player] in player?.fullScreenPresented == true }
+                )
+                .allowsHitTesting(false)
+                // Cover the staging renderer until it becomes the active surface.
+                .overlay {
+                    if player.vlcPlayback == nil { Color.black.allowsHitTesting(false) }
+                }
+            }
+            if showsNativeVideoSurface {
+                PlayerSurface(player: player.player)
+            }
+            PlaybackStatusOverlay(state: player.loadState)
         }
+        .frame(width: size.width, height: size.height)
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.5)
+                .sequenced(before: DragGesture(minimumDistance: 0))
+                .updating($isHoldingVideo) { value, isHolding, _ in
+                    if case .second(true, _) = value { isHolding = true }
+                },
+            including: showsNativeVideoSurface ? .none : .all
+        )
+        .onChange(of: isHoldingVideo) { _, isHolding in
+            if isHolding, popupDidOpen, scenePhase == .active {
+                player.beginPlaybackBoost()
+            } else {
+                player.endPlaybackBoost()
+            }
         }
+        .overlay(alignment: .top) {
+            if player.isHoldingPlaybackBoost {
+                Text(verbatim: "2×")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.75), in: Capsule())
+                    .padding(.top, 12)
+                    .allowsHitTesting(false)
+            }
+        }
+        // Pull-down-to-dismiss starting from the video surface.
+        //
+        // `AVPlayerViewController`'s internal `UIPanGestureRecognizer`s (scrubber, system
+        // controls) consume touches before they can reach LNPopupUI's outer pan, so the
+        // library's `.popupInteractionStyle(.drag)` only works when the gesture starts on
+        // SwiftUI views below the video (comments / queue). `.simultaneousGesture` is the
+        // escape hatch: SwiftUI composes this `DragGesture` with the UIKit recognizers
+        // underneath instead of arbitrating between them, so AVPlayerViewController's
+        // controls keep working AND we can detect a downward pull and dismiss the popup
+        // imperatively. LNPopupUI animates the collapse — we just flip the binding.
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 30, coordinateSpace: .global)
+                .onEnded { value in
+                    let mostlyDown = value.translation.height > 90
+                        && abs(value.translation.width) < value.translation.height
+                    let fastFlick = value.predictedEndTranslation.height > 180
+                    if mostlyDown || fastFlick {
+                        @Bindable var p = player
+                        p.fullScreenPresented = false
+                    }
+                }
+        )
+    }
+
+    @ViewBuilder
+    private var youtubeSubtitle: some View {
+        if let subtitle = player.youtubeSubtitleText {
+            Text(verbatim: subtitle)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .shadow(color: .black, radius: 2, x: 0, y: 1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func playbackControls(showsPanel: Bool) -> some View {
+        VStack(spacing: 0) {
+            let duration = player.duration
+            if player.vlcPlayback != nil, player.loadState == .readyToPlay, duration.isFinite, duration > 0 {
+                let seekPosition = Binding(
+                    get: { min(duration, max(0, vlcSeekPosition ?? player.elapsed)) },
+                    set: { vlcSeekPosition = $0 }
+                )
+                let positionText = playbackTimeString(seekPosition.wrappedValue)
+                let durationText = playbackTimeString(duration)
+
+                VStack(spacing: 2) {
+                    Slider(value: seekPosition, in: 0...duration) { editing in
+                        if !editing, let position = vlcSeekPosition {
+                            vlcSeekPosition = nil
+                            player.seek(to: position)
+                        }
+                    }
+                    .accessibilityLabel(Text("Playback"))
+                    .accessibilityValue(Text("\(positionText) of \(durationText)"))
+
+                    HStack {
+                        Text(verbatim: positionText)
+                        Spacer()
+                        Text(verbatim: durationText)
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                }
+                .padding(.horizontal, 16)
+                .onDisappear { vlcSeekPosition = nil }
+            }
+
+            if player.isAirPlayMode {
+                airPlayControls
+            }
+
+            transportRow(showsPanelToggle: showsPanel)
+                .padding(.vertical, 10)
+
+            if showsPanel { Divider() }
+        }
+    }
+
+    private func playbackTimeString(_ time: TimeInterval) -> String {
+        let total = Int(time)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%d:%02d", minutes, seconds)
     }
 
     // MARK: - Close button
@@ -304,16 +448,6 @@ struct FullScreenPlayer: View {
                 // while the panel-mode comments/queue area keeps the popup's outer thinMaterial.
                 .background {
                     Color.black.ignoresSafeArea()
-                }
-                // Reserve room for the player's outer bottom Close button so the last
-                // ChannelScreen row isn't hidden behind the glass capsule. The outer
-                // `.safeAreaInset(edge: .bottom)` (line ~193) reserves it on the outermost
-                // container, but the NavigationStack inside `channelStack` creates a fresh
-                // UIHostingController whose internal `List` ignores that ancestor inset
-                // — same propagation gap the playback-queue panel hit. Mirroring the inset
-                // here lifts the List's content above the Close button.
-                .safeAreaInset(edge: .bottom) {
-                    Color.clear.frame(height: Self.closeButtonReserveHeight)
                 }
 
             Button {
@@ -525,8 +659,22 @@ struct FullScreenPlayer: View {
 
     // MARK: - Transport
 
+    private var airPlayControls: some View {
+        HStack {
+            AirPlayRoutePicker()
+                .frame(width: 44, height: 44)
+            if player.isExternalPlaybackActive {
+                Text("AirPlay connected")
+            } else {
+                Text("Choose an AirPlay device")
+            }
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 12)
+    }
+
     @ViewBuilder
-    private var transportRow: some View {
+    private func transportRow(showsPanelToggle: Bool) -> some View {
         // Flexible `Spacer()`s on both outer ends AND between every adjacent pair so every gap
         // — edge-to-button and button-to-button — sizes itself to the same width. Keeps the
         // optical rhythm even across device widths instead of the previous mixed model (fixed
@@ -571,9 +719,10 @@ struct FullScreenPlayer: View {
 
             Spacer(minLength: 0)
 
-            queueToggleButton
-
-            Spacer(minLength: 0)
+            if showsPanelToggle {
+                queueToggleButton
+                Spacer(minLength: 0)
+            }
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 12)
@@ -596,6 +745,22 @@ struct FullScreenPlayer: View {
         Menu {
             if let video = player.currentVideo {
                 resolutionMenu
+                playbackTrackMenu(.audio, title: "Audio track", systemImage: "speaker.wave.2")
+                subtitleMenu
+                playbackSpeedMenu
+                if player.isAirPlayMode {
+                    Button {
+                        player.stopAirPlay()
+                    } label: {
+                        Label("Play on This Device", systemImage: "play.rectangle")
+                    }
+                } else if player.canUseAirPlay {
+                    Button {
+                        player.startAirPlay()
+                    } label: {
+                        Label("AirPlay", systemImage: "airplayvideo")
+                    }
+                }
                 Divider()
                 let localFile = DownloadManager.shared.localFile(for: video.id)
                 Button {
@@ -664,6 +829,107 @@ struct FullScreenPlayer: View {
             Image(systemName: "ellipsis.circle")
                 .font(.title2)
         }
+    }
+
+    @ViewBuilder
+    private var subtitleMenu: some View {
+        if player.canLoadYouTubeSubtitles {
+            let streamTracks = player.trackMenu(for: .subtitle)
+            let isOff = player.selectedYouTubeSubtitleID == nil && streamTracks?.tracks.contains(where: \.isSelected) != true
+            Menu {
+                Button(action: player.turnOffSubtitles) {
+                    if isOff {
+                        Label("Off", systemImage: "checkmark")
+                    } else {
+                        Text("Off")
+                    }
+                }
+                if player.isLoadingYouTubeSubtitleTrack || player.youtubeSubtitleListState == .idle
+                    || player.youtubeSubtitleListState == .loading {
+                    Button("Loading YouTube subtitles…") {}.disabled(true)
+                } else if player.youtubeSubtitleListState == .failed {
+                    Button("Retry loading YouTube subtitles", action: player.findYouTubeSubtitles)
+                } else if player.youtubeSubtitleListState == .unavailable {
+                    Button("No YouTube subtitles available") {}.disabled(true)
+                } else {
+                    ForEach(player.youtubeSubtitleTracks) { track in
+                        Button {
+                            player.selectYouTubeSubtitle(track.id)
+                        } label: {
+                            let title = youtubeSubtitleTitle(track)
+                            if player.selectedYouTubeSubtitleID == track.id {
+                                Label { title } icon: { Image(systemName: "checkmark") }
+                            } else {
+                                title
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Label("Subtitles", systemImage: "captions.bubble")
+            }
+        } else {
+            playbackTrackMenu(.subtitle, title: "Subtitles", systemImage: "captions.bubble")
+        }
+    }
+
+    private func youtubeSubtitleTitle(_ track: RemoteSubtitle) -> Text {
+        let name = track.langName ?? track.id
+        if track.isAutoGenerated {
+            return Text("\(name) (auto-generated)")
+        }
+        return Text(verbatim: name)
+    }
+
+    @ViewBuilder
+    private func playbackTrackMenu(_ kind: PlaybackTrackKind, title: LocalizedStringKey, systemImage: String) -> some View {
+        if let options = player.trackMenu(for: kind) {
+            Menu {
+                Picker(selection: Binding(
+                    get: { options.tracks.first(where: \.isSelected)?.id },
+                    set: { options.select($0) }
+                )) {
+                    if options.allowsOff {
+                        Text("Off").tag(nil as String?)
+                    }
+                    ForEach(options.tracks) { track in
+                        Text(verbatim: track.title).tag(Optional(track.id))
+                    }
+                } label: {
+                    Text(title)
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label(title, systemImage: systemImage)
+            }
+        } else {
+            Button {} label: {
+                Label(title, systemImage: systemImage)
+            }
+            .disabled(true)
+        }
+    }
+
+    private var playbackSpeedMenu: some View {
+        let presets: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
+        let current = player.playbackSpeed
+        let speeds = presets.contains(current) ? presets : (presets + [current]).sorted()
+        return Menu {
+            Picker(selection: Binding(
+                get: { player.playbackSpeed },
+                set: { player.changePlaybackSpeed(to: $0) }
+            )) {
+                ForEach(speeds, id: \.self) { speed in
+                    Text(verbatim: "\(speed.formatted(.number.precision(.fractionLength(0...2))))×").tag(speed)
+                }
+            } label: {
+                Text("Playback speed")
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label("Playback speed", systemImage: "speedometer")
+        }
+        .disabled(!player.canChangePlaybackOptions)
     }
 
     @ViewBuilder
@@ -846,12 +1112,6 @@ struct FullScreenPlayer: View {
     /// occupies 64pt of vertical space in the List.
     private static let queueRowHeight: CGFloat = 56
 
-    /// Approximate bottom footprint of the player's Close button (label vertical padding +
-    /// glass-button chrome + the wrapping HStack's `.padding(.bottom, 8)`). Used to inset
-    /// any pushed channel/playlist content via `.safeAreaInset(edge: .bottom)` so the last
-    /// row isn't hidden behind the close pill. SwiftUI adds the home-indicator safe area
-    /// on top of this automatically — we only need to reserve the button height itself.
-    private static let closeButtonReserveHeight: CGFloat = 56
     /// Per-row footprint including insets, used by `queueListHeight` below.
     private static let queueRowFootprint: CGFloat = queueRowHeight + 8 // 4pt top + 4pt bottom insets
 

@@ -219,11 +219,26 @@ final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate {
     }
 }
 
-/// A snapshot of the master playlist, with enough information to construct an exact-resolution asset.
+/// A snapshot of the master playlist for building exact-resolution or capped adaptive assets.
 nonisolated struct HLSResolutionPlaylist: Sendable {
+    enum VLCCodecSelection: String, Sendable {
+        case all
+        case vp9
+        case other
+        case preferVP9
+    }
+
     private struct Entry: Sendable {
         let text: String
         let resolution: Int?
+
+        var isStreamVariant: Bool { text.hasPrefix("#EXT-X-STREAM-INF:") }
+    }
+
+    private struct VLCVariant {
+        let entry: Entry
+        let groups: [Substring: Substring]
+        let isVP9: Bool
     }
 
     private let entries: [Entry]
@@ -254,7 +269,7 @@ nonisolated struct HLSResolutionPlaylist: Sendable {
     func makePlayback(resolution: Int) -> (asset: AVURLAsset, loader: HLSResolutionResourceLoader)? {
         guard resolutions.contains(resolution) else { return nil }
         let lines = entries.compactMap { entry in
-            entry.resolution == nil || entry.resolution == resolution ? entry.text : nil
+            entry.resolution == resolution || (entry.resolution == nil && !entry.isStreamVariant) ? entry.text : nil
         }
         var urlString = "freetubehlsresolution://playlist/\(UUID().uuidString)/master.m3u8"
         // QUERYPARAM definitions in the master must also work for IMPORT tags in child playlists.
@@ -265,6 +280,106 @@ nonisolated struct HLSResolutionPlaylist: Sendable {
         let asset = AVURLAsset(url: url)
         asset.resourceLoader.setDelegate(loader, queue: .main)
         return (asset, loader)
+    }
+
+    func vlcPlaybackData(
+        resolution: Int? = nil, maximumResolution: Int? = nil, codec: VLCCodecSelection = .all
+    ) -> Data? {
+        // VLC's local master cannot supply variables that a child playlist imports.
+        guard !entries.contains(where: { $0.text.hasPrefix("#EXT-X-DEFINE:") }) else {
+            return nil
+        }
+        let whitelist: Set<Int>?
+        if let resolution {
+            guard resolutions.contains(resolution), resolution <= (maximumResolution ?? resolution) else { return nil }
+            whitelist = [resolution]
+        } else if let maximumResolution {
+            whitelist = Set(resolutions.filter { $0 <= maximumResolution })
+        } else {
+            whitelist = nil
+        }
+
+        let renditionTypes: Set<Substring> = ["AUDIO", "VIDEO", "SUBTITLES", "CLOSED-CAPTIONS"]
+        let renditions = entries.compactMap { entry -> (type: Substring, group: Substring, line: String, isSupported: Bool)? in
+            guard entry.text.hasPrefix("#EXT-X-MEDIA:") else { return nil }
+            let attributes = Self.attributes(in: entry.text)
+            guard let type = attributes["TYPE"], renditionTypes.contains(type), let group = attributes["GROUP-ID"] else {
+                return nil
+            }
+            return (type, group, entry.text, Self.hasHTTPSURI(in: attributes))
+        }
+        let groupsByType = Dictionary(grouping: renditions, by: \.type)
+            .mapValues { Dictionary(grouping: $0, by: \.group) }
+        var variants: [VLCVariant] = []
+        for entry in entries where entry.isStreamVariant {
+            if let whitelist {
+                guard let size = entry.resolution, whitelist.contains(size) else { continue }
+            }
+            guard let tag = entry.text.split(separator: "\n", maxSplits: 1).first else { continue }
+            let attributes = Self.attributes(in: String(tag))
+            let groups = attributes.filter { type, group in
+                renditionTypes.contains(type) && !(type == "CLOSED-CAPTIONS" && group == "NONE")
+            }
+            guard groups.allSatisfy({ type, group in
+                groupsByType[type]?[group]?.allSatisfy(\.isSupported) == true
+            }) else { continue }
+            let isVP9 = attributes["CODECS"]?.split(separator: ",").contains { codec in
+                let name = codec.trimmingCharacters(in: .whitespaces).lowercased()
+                return name == "vp9" || name == "vp09" || name.hasPrefix("vp9.") || name.hasPrefix("vp09.")
+            } ?? false
+            variants.append(VLCVariant(entry: entry, groups: groups, isVP9: isVP9))
+        }
+
+        let selected = switch codec {
+        case .all:
+            variants
+        case .vp9:
+            variants.filter { $0.isVP9 }
+        case .other:
+            variants.filter { !$0.isVP9 }
+        case .preferVP9:
+            variantsPreferringVP9(variants)
+        }
+        guard !selected.isEmpty else { return nil }
+        // The adaptive preference only needs a local master when it changes a resolution's variants.
+        if codec == .preferVP9, selected.count == variants.count { return nil }
+
+        var selectedGroups: [Substring: Set<Substring>] = [:]
+        for variant in selected {
+            for (type, group) in variant.groups {
+                selectedGroups[type, default: []].insert(group)
+            }
+        }
+
+        // Retain the master tags needed by the selected streams. Stream and rendition URLs
+        // were resolved against the final HTTPS response URL before changing to a local file.
+        var headers: [String] = []
+        for entry in entries {
+            let line = entry.text
+            if line == "#EXTM3U" || line.hasPrefix("#EXT-X-VERSION:") || line == "#EXT-X-INDEPENDENT-SEGMENTS" {
+                headers.append(line)
+            } else if line.hasPrefix("#EXT-X-SESSION-KEY:") {
+                guard Self.hasHTTPSURI(in: Self.attributes(in: line)) else { return nil }
+                headers.append(line)
+            }
+        }
+        let selectedRenditions = renditions.filter { selectedGroups[$0.type]?.contains($0.group) == true }.map(\.line)
+        let selectedVariants = selected.map { $0.entry.text }
+        return Data(((headers + selectedRenditions + selectedVariants).joined(separator: "\n") + "\n").utf8)
+    }
+
+    private func variantsPreferringVP9(_ variants: [VLCVariant]) -> [VLCVariant] {
+        let vp9Resolutions = Set(variants.compactMap { $0.isVP9 ? $0.entry.resolution : nil })
+        return variants.filter { variant in
+            guard !variant.isVP9, let resolution = variant.entry.resolution else { return true }
+            return !vp9Resolutions.contains(resolution)
+        }
+    }
+
+    private static func hasHTTPSURI(in attributes: [Substring: Substring]) -> Bool {
+        guard let uri = attributes["URI"] else { return true }
+        guard let url = URL(string: String(uri), encodingInvalidCharacters: false) else { return false }
+        return url.scheme?.lowercased() == "https" && url.host != nil
     }
 
     private init(manifest: String, baseURL: URL) throws {
@@ -285,12 +400,11 @@ nonisolated struct HLSResolutionPlaylist: Sendable {
             if !line.hasPrefix("#") {
                 guard let variant = pendingVariant else { throw URLError(.cannotParseResponse) }
                 pendingVariant = nil
-                guard let resolution = variant.resolution else { continue }
                 let uri = try Self.resolveURI(line, against: baseURL, variables: variables)
                 guard let url = URL(string: uri, encodingInvalidCharacters: false),
                       url.scheme?.lowercased() == "https", url.host != nil else { continue }
-                found.insert(resolution)
-                parsed.append(Entry(text: variant.tag + "\n" + uri, resolution: resolution))
+                if let resolution = variant.resolution { found.insert(resolution) }
+                parsed.append(Entry(text: variant.tag + "\n" + uri, resolution: variant.resolution))
                 continue
             }
 
@@ -332,7 +446,7 @@ nonisolated struct HLSResolutionPlaylist: Sendable {
             parsed.append(Entry(text: line, resolution: resolution))
         }
 
-        guard pendingVariant == nil, !found.isEmpty else { throw URLError(.cannotParseResponse) }
+        guard pendingVariant == nil, parsed.contains(where: \.isStreamVariant) else { throw URLError(.cannotParseResponse) }
         resolutions = found.sorted(by: >)
         entries = parsed
         query = usesQuery ? baseComponents?.percentEncodedQuery : nil

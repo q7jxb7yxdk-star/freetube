@@ -1,7 +1,6 @@
 import SwiftUI
 import LNPopupUI
 import Kingfisher
-import OSLog
 import UIKit
 
 /// Top-level tabbed shell. CLAUDE.md §8: mini-player sits above the tab bar and persists across tabs.
@@ -16,12 +15,12 @@ import UIKit
 struct RootView: View {
     @Environment(PlayerStateManager.self) private var player
     @State private var selectedTab: Tab = .search
+    @State private var popupDidOpen = false
     /// Direct observation of the shared download manager — no AsyncStream subscription needed since
     /// `DownloadManager` is itself `@Observable`. Both this view (for the badge) and `DownloadsScreen`
     /// (for the list) read the same source of truth.
     @State private var downloads = DownloadManager.shared
-    /// Cached thumbnail for the current video so the mini-player bar shows the actual preview instead
-    /// of a placeholder icon. Loaded via Kingfisher's cache when `currentVideo` changes.
+    /// Artwork shown while the mini-player waits for the current video.
     @State private var thumbnail: UIImage?
 
     enum Tab: Hashable {
@@ -66,33 +65,23 @@ struct RootView: View {
         }
         .popup(
             isBarPresented: $player.miniPlayerVisible,
-            isPopupOpen: $player.fullScreenPresented
+            isPopupOpen: $player.fullScreenPresented,
+            // Transfer VLC after LNPopupUI finishes laying out the destination.
+            onOpen: { popupDidOpen = true },
+            onClose: { popupDidOpen = false }
         ) {
-            // The popup's content closure is called once and its result is hosted; SwiftUI does NOT
-            // re-evaluate the closure on every parent body re-render. So any modifier that takes a
-            // captured value (like `.popupProgress(value)`) freezes at the closure-creation time.
-            // To get live progress updates we wrap the modifiers in `PopupContentWrapper`, which is
-            // itself a `View` observing the player — when `player.elapsed` changes, the wrapper's
-            // body re-renders and `.popupProgress(...)` re-applies with the new value.
-            PopupContentWrapper(thumbnail: thumbnail)
+            PopupContentWrapper(popupDidOpen: $popupDidOpen)
         }
-        // `.drag` enables LNPopupUI's pull-down-from-content gesture for collapsing the
-        // expanded player. Previously we had `.snap` here PLUS a hand-rolled `DragGesture` in
-        // `FullScreenPlayer.body` — the two raced each other and the visible offset wouldn't
-        // track the finger during the drag once playback became interactive. `.drag` alone is
-        // what LNPopupUI ships for this exact use case; the popup bar's own tap-to-open still
-        // works the same.
+        .popupBarCustomView(wantsDefaultTapGesture: false) {
+            MiniPlayerBar(player: player, thumbnail: $thumbnail, popupDidOpen: $popupDidOpen)
+        }
         .popupInteractionStyle(UIViewController.PopupInteractionStyle.drag)
         .popupCloseButtonStyle(LNPopupCloseButton.Style.none)
-        .popupBarStyle(LNPopupBar.Style.floating)
-        // Explicitly enable the thin progress line at the bottom of the popup bar so playback
-        // and download progress are always visible without expanding the player.
         .popupBarProgressViewStyle(.bottom)
         .task {
             await SessionManager.shared.bootstrap()
         }
-        // Refresh the cached thumbnail whenever the user picks a new video. The mini-player's
-        // `popupImage` reads this so it shows the actual preview instead of a placeholder icon.
+        // Refresh the fallback artwork whenever the user picks a new video.
         .onChange(of: player.currentVideo?.id, initial: true) {
             loadThumbnailForCurrentVideo()
         }
@@ -104,6 +93,9 @@ struct RootView: View {
         // the popup collapses so the rest of the app honors the system appearance again.
         .onChange(of: player.fullScreenPresented) { _, presented in
             updateStatusBarOverride(forFullScreenOpen: presented)
+        }
+        .onChange(of: player.miniPlayerVisible) { _, visible in
+            if !visible { popupDidOpen = false }
         }
         // Menu-bar / keyboard-shortcut driven tab switching from `MacCommands`. The
         // notification is meaningful only on Mac (where the menu bar exists) and on iPad
@@ -166,130 +158,141 @@ struct RootView: View {
             }
         }
     }
+}
 
-    private var popupImage: Image {
-        if let thumbnail {
-            return Image(uiImage: thumbnail)
+@available(iOS 17.0, *)
+private struct MiniPlayerBar: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    let player: PlayerStateManager
+    @Binding var thumbnail: UIImage?
+    @Binding var popupDidOpen: Bool
+
+    private var maximumPreviewWidth: CGFloat {
+        horizontalSizeClass == .regular ? 192 : 160
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = min(maximumPreviewWidth, geometry.size.width * 0.43)
+            HStack(spacing: 4) {
+                Button {
+                    player.fullScreenPresented = true
+                } label: {
+                    HStack(spacing: 8) {
+                        preview
+                            .frame(width: width, height: width * 9 / 16)
+                            .clipShape(.rect(cornerRadius: 8))
+                            .accessibilityHidden(true)
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(player.currentVideo?.title ?? "")
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(2)
+                            subtitle
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                }
+
+                Button {
+                    player.togglePlayPause()
+                } label: {
+                    Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel(player.isPlaying ? Text("Pause") : Text("Play"))
+
+                Button {
+                    player.playNext()
+                } label: {
+                    Image(systemName: "forward.fill")
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel(Text("Next"))
+            }
+            .buttonStyle(.plain)
         }
-        return Image(systemName: "play.rectangle.fill")
+        .frame(height: maximumPreviewWidth * 9 / 16 + 8)
+        .padding(.horizontal, 8)
     }
 
-    private var progressValue: Float {
-        PopupContentWrapper.progress(for: player)
+    private var preview: some View {
+        ZStack {
+            Color.black
+            if !popupDidOpen, player.vlcPlayback != nil || player.stagedVLCPlayback != nil {
+                VLCKitSurface(
+                    activeDrawable: player.vlcPlayback?.drawable,
+                    stagedDrawable: player.stagedVLCPlayback?.drawable,
+                    isCurrentHost: { !popupDidOpen },
+                    canStartPlayback: { [weak player] in player?.fullScreenPresented == false }
+                )
+                .allowsHitTesting(false)
+
+                // Lay out the staged drawable behind the artwork so it can start decoding.
+                if player.vlcPlayback == nil {
+                    Color.black
+                    artwork
+                }
+            } else {
+                artwork
+                if !popupDidOpen, player.loadState == .readyToPlay, !player.isExternalPlaybackActive {
+                    InlinePlayerSurface(player: player.player)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
     }
 
-    private var popupSubtitle: String {
+    @ViewBuilder
+    private var artwork: some View {
+        if let thumbnail {
+            Image(uiImage: thumbnail)
+                .resizable()
+                .scaledToFit()
+        } else {
+            Image(systemName: "play.rectangle.fill")
+                .foregroundStyle(.white.opacity(0.75))
+        }
+    }
+
+    private var subtitle: Text {
         switch player.loadState {
         case .resolving:
-            return "Preparing…"
-        case .failed(let msg):
-            return msg
+            Text("Preparing…")
+        case .failed(let message):
+            Text(message)
         case .idle, .readyToPlay:
-            return player.currentVideo?.channelName ?? ""
+            Text(player.currentVideo?.channelName ?? "")
         }
     }
 }
 
-/// Hosts the popup's `FullScreenPlayer` and all of its `popup*(...)` metadata modifiers.
-///
-/// **Why this exists:** `RootView.popup { ... }` calls its content closure once at popup-presentation
-/// time, so any captured value (like `progressValue`) freezes there. Wrapping the content in a real
-/// `View` makes SwiftUI's observation system re-render the body when the player's state changes.
-///
-/// **Why state-driven progress and not direct read:** even with @Environment observation, in
-/// practice the `.popupProgress(_:)` preference key didn't always re-apply on every body re-render
-/// (suspected: LNPopupUI's preference reducer coalesces same-valued updates, and SwiftUI may skip
-/// modifier re-application when the captured Float equals the previous one byte-for-byte). Driving
-/// it through explicit `@State` mirrors and `.onChange` handlers forces the modifier to see a fresh
-/// captured value every time the player ticks.
-/// Made non-private so `MacRootView` can reuse the same popup chrome when running on
-/// Mac via "Designed for iPad" — same look as the iOS mini-bar, same drag-to-expand
-/// behavior, no duplicated styling.
 @available(iOS 17.0, *)
-struct PopupContentWrapper: View {
+private struct PopupContentWrapper: View {
     @Environment(PlayerStateManager.self) private var player
-    let thumbnail: UIImage?
-
-    /// Mirrored progress state so `.popupProgress(_:)` always receives a fresh-captured value.
+    @Binding var popupDidOpen: Bool
+    // Mirror progress in state so LNPopupUI receives a fresh preference as playback advances.
     @State private var progress: Float = 0
-    @State private var subtitleText: String = ""
-
-    private static let log = AppLog(subsystem: "com.leshko.freetube", category: "PopupProgress")
 
     var body: some View {
-        FullScreenPlayer()
-            .popupTitle(player.currentVideo?.title ?? "", subtitle: subtitleText)
-            .popupImage(image)
+        FullScreenPlayer(popupDidOpen: $popupDidOpen)
             .popupProgress(progress)
-            .popupBarButtons {
-                ToolbarItemGroup(placement: .popupBar) {
-                    Button {
-                        player.togglePlayPause()
-                    } label: {
-                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                            .foregroundStyle(Color.primary)
-                    }
-                    Button {
-                        player.playNext()
-                    } label: {
-                        Image(systemName: "forward.fill")
-                            .foregroundStyle(Color.primary)
-                    }
-                }
-            }
-            // Pump the mirrored state whenever any input changes. iOS 17's @Observable observation
-            // makes these `onChange` fire reliably even though SwiftUI's modifier diffing wouldn't.
-            .onChange(of: player.elapsed, initial: true) { old, new in
-                // Self.log.debug("onChange.elapsed old=\(old, privacy: .public) new=\(new, privacy: .public)")
-                refreshProgress(trigger: "elapsed")
-            }
-            .onChange(of: player.duration) { old, new in
-                // Self.log.debug("onChange.duration old=\(old, privacy: .public) new=\(new, privacy: .public)")
-                refreshProgress(trigger: "duration")
-            }
-            .onChange(of: player.loadState, initial: true) { old, new in
-                // Self.log.info("onChange.loadState old=\(String(describing: old), privacy: .public) new=\(String(describing: new), privacy: .public)")
-                refreshProgress(trigger: "loadState")
-                subtitleText = computedSubtitle
-            }
-            .onChange(of: player.currentVideo?.id, initial: true) { old, new in
-                // Self.log.info("onChange.video old=\(old ?? "nil", privacy: .public) new=\(new ?? "nil", privacy: .public)")
-                subtitleText = computedSubtitle
-            }
+            .onChange(of: player.elapsed, initial: true) { _, _ in refreshProgress() }
+            .onChange(of: player.duration) { _, _ in refreshProgress() }
+            .onChange(of: player.loadState) { _, _ in refreshProgress() }
     }
 
-    private func refreshProgress(trigger: String) {
-        let next = Self.progress(for: player)
-        let changed = abs(next - progress) > 0.001
-        // Self.log.debug("refreshProgress[\(trigger, privacy: .public)] prev=\(self.progress, privacy: .public) next=\(next, privacy: .public) changed=\(changed, privacy: .public)")
-        if changed {
+    private func refreshProgress() {
+        let next = player.duration > 0 ? Float(min(1, max(0, player.elapsed / player.duration))) : 0
+        if abs(next - progress) > 0.001 {
             progress = next
         }
-    }
-
-    /// Static helper for the few external callers that still want a snapshot.
-    static func progress(for player: PlayerStateManager) -> Float {
-        guard player.duration > 0 else { return 0 }
-        return Float(min(1, max(0, player.elapsed / player.duration)))
-    }
-
-    private var computedSubtitle: String { subtitle }
-
-    private var subtitle: String {
-        switch player.loadState {
-        case .resolving:
-            return "Preparing…"
-        case .failed(let msg):
-            return msg
-        case .idle, .readyToPlay:
-            return player.currentVideo?.channelName ?? ""
-        }
-    }
-
-    private var image: Image {
-        if let thumbnail {
-            return Image(uiImage: thumbnail)
-        }
-        return Image(systemName: "play.rectangle.fill")
     }
 }

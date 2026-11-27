@@ -8,7 +8,13 @@ import YouTubeKit
 final class WatchHistorySyncService {
     static let shared = WatchHistorySyncService()
 
-    typealias WatchTimeReporter = @MainActor (ClosedRange<TimeInterval>) -> Void
+    enum PlaybackState {
+        case playing
+        case paused
+        case finished
+    }
+
+    typealias WatchTimeReporter = @MainActor (ClosedRange<TimeInterval>, PlaybackState) -> Void
 
     private struct ReportingSession {
         let watchTimeURL: URL
@@ -19,6 +25,8 @@ final class WatchHistorySyncService {
     private let preferences = UserPreferences()
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "WatchHistorySync")
     private let session: URLSession
+    private var pendingSeek: Task<Void, Never>?
+    private var pendingFinalReport: Task<Void, Never>?
 
     private init() {
         let configuration = URLSessionConfiguration.ephemeral
@@ -42,12 +50,38 @@ final class WatchHistorySyncService {
             log.notice("Skipped playback reporting because the session is missing")
             return nil
         }
-        let start = Task { await submitPlaybackStart(videoID: videoID, cookies: cookies) }
-        return { segment in
-            Task {
+        let precedingFinalReport = pendingFinalReport
+        let start = Task {
+            await precedingFinalReport?.value
+            return await submitPlaybackStart(videoID: videoID, cookies: cookies)
+        }
+        var previousReport: Task<Void, Never>?
+        return { segment, state in
+            let previous = previousReport
+            let report = Task {
+                await previous?.value
                 guard let reportingSession = await start.value else { return }
-                await self.submitWatchTime(segment, session: reportingSession, cookies: cookies)
+                await self.submitWatchTime(segment, state: state, session: reportingSession, cookies: cookies)
             }
+            previousReport = report
+            if state == .finished { self.pendingFinalReport = report }
+        }
+    }
+
+    func prepareHistoryRefresh(after seek: Task<Void, Never>) {
+        pendingSeek = seek
+    }
+
+    func waitForPendingProgress() async {
+        guard preferences.syncYouTubeWatchHistory else { return }
+        // The confirmed seek can enqueue a final report before it returns.
+        while !Task.isCancelled {
+            let seek = pendingSeek
+            await seek?.value
+            guard !Task.isCancelled else { return }
+            let finalReport = pendingFinalReport
+            await finalReport?.value
+            if seek == pendingSeek, finalReport == pendingFinalReport { return }
         }
     }
 
@@ -87,6 +121,7 @@ final class WatchHistorySyncService {
 
     private func submitWatchTime(
         _ segment: ClosedRange<TimeInterval>,
+        state: PlaybackState,
         session: ReportingSession,
         cookies: String
     ) async {
@@ -96,10 +131,12 @@ final class WatchHistorySyncService {
             URLQueryItem(name: "st", value: String(segment.lowerBound)),
             URLQueryItem(name: "et", value: end),
             URLQueryItem(name: "cmt", value: end),
-            URLQueryItem(name: "final", value: "1")
+            URLQueryItem(name: "state", value: state == .playing ? "playing" : "paused"),
+            URLQueryItem(name: "final", value: state == .finished ? "1" : "0")
         ], on: &components)
         guard let url = components.url else { return }
-        await sendReport(to: url, watchPage: session.watchPage, cookies: cookies, stage: "Watch time")
+        let stage = "Watch time (\(state), position=\(end)s)"
+        await sendReport(to: url, watchPage: session.watchPage, cookies: cookies, stage: stage)
     }
 
     private func sendReport(to url: URL, watchPage: URLRequest, cookies: String, stage: String) async {

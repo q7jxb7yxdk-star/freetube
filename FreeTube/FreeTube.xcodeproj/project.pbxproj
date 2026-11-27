@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0A2B2136A8244F99AAB6434E /* VLCKit in Frameworks */ = {isa = PBXBuildFile; productRef = 7130592F268545C0809B4C2B /* VLCKit */; };
 		AC591D782FB9E26E009EE538 /* YouTubeKit in Frameworks */ = {isa = PBXBuildFile; productRef = AC591D772FB9E26E009EE538 /* YouTubeKit */; };
 		AC591D892FB9E2BE009EE538 /* FFmpeg-iOS-Lame in Frameworks */ = {isa = PBXBuildFile; productRef = AC591D882FB9E2BE009EE538 /* FFmpeg-iOS-Lame */; };
 		AC591DA82FB9E35C009EE538 /* Kingfisher in Frameworks */ = {isa = PBXBuildFile; productRef = AC591DA72FB9E35C009EE538 /* Kingfisher */; };
@@ -77,6 +78,7 @@
 				AC591D782FB9E26E009EE538 /* YouTubeKit in Frameworks */,
 				AC591F022FB9F300009EE538 /* FFmpeg-iOS-Support in Frameworks */,
 				AC5924CE2FBB5F2B009EE538 /* SwimplyPlayIndicator in Frameworks */,
+				0A2B2136A8244F99AAB6434E /* VLCKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -131,6 +133,7 @@
 				AC591E142FB9F181009EE538 /* LNPopupUI */,
 				AC591F012FB9F300009EE538 /* FFmpeg-iOS-Support */,
 				AC5924CD2FBB5F2B009EE538 /* SwimplyPlayIndicator */,
+				7130592F268545C0809B4C2B /* VLCKit */,
 			);
 			productName = FreeTube;
 			productReference = AC591D232FB9BEE5009EE538 /* FreeTube.app */;
@@ -171,6 +174,7 @@
 				AC591E132FB9F181009EE538 /* XCRemoteSwiftPackageReference "LNPopupUI" */,
 				AC591F002FB9F300009EE538 /* XCRemoteSwiftPackageReference "FFmpeg-iOS-Support" */,
 				AC5924CC2FBB5F2B009EE538 /* XCRemoteSwiftPackageReference "SwimplyPlayIndicator" */,
+				F0F5A790436F4EE1BE172984 /* XCRemoteSwiftPackageReference "vlckit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AC591D242FB9BEE5009EE538 /* Products */;
@@ -362,7 +366,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 20261126;
+				CURRENT_PROJECT_VERSION = 20261127;
 				DEVELOPMENT_TEAM = WX793X49GJ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -413,7 +417,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 20261126;
+				CURRENT_PROJECT_VERSION = 20261127;
 				DEVELOPMENT_TEAM = WX793X49GJ;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_TESTABILITY = YES;
@@ -541,9 +545,22 @@
 				minimumVersion = 1.2.0;
 			};
 		};
+		F0F5A790436F4EE1BE172984 /* XCRemoteSwiftPackageReference "vlckit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/videolan/vlckit.git";
+			requirement = {
+				kind = revision;
+				revision = 3d0f0fa7031eab1a67c817c98a495e1c68fc998c;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		7130592F268545C0809B4C2B /* VLCKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F0F5A790436F4EE1BE172984 /* XCRemoteSwiftPackageReference "vlckit" */;
+			productName = VLCKit;
+		};
 		AC591D772FB9E26E009EE538 /* YouTubeKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = AC591D762FB9E26E009EE538 /* XCRemoteSwiftPackageReference "YouTubeKit" */;

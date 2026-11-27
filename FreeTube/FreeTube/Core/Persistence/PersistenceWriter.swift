@@ -43,7 +43,9 @@ actor PersistenceWriter {
             existing.watchedAt = .now
             existing.title = title
             existing.channelName = channelName
-            existing.thumbnailURL = thumbnailURL
+            if let thumbnailURL {
+                existing.thumbnailURL = thumbnailURL
+            }
         } else {
             modelContext.insert(WatchHistoryEntry(
                 videoID: videoID,
